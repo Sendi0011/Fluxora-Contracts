@@ -7397,3 +7397,67 @@ fn test_extend_stream_end_time_rejects_when_deposit_insufficient() {
     ctx.client()
         .extend_stream_end_time(&stream_id, &2_000u64);
 }
+
+// ---------------------------------------------------------------------------
+// Tests — decrease_stream_deposit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_decrease_stream_deposit_refunds_only_unaccrued_amount() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // At t=300, 300 tokens are accrued, 700 unaccrued.
+    ctx.env.ledger().set_timestamp(300);
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 300);
+
+    let sender_before = ctx.token().balance(&ctx.sender);
+
+    // Decrease deposit from 1000 → 300; refund should be 700 (the unaccrued portion).
+    ctx.client()
+        .decrease_stream_deposit(&stream_id, &300_i128);
+
+    let sender_after = ctx.token().balance(&ctx.sender);
+    assert_eq!(sender_after - sender_before, 700);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, 300);
+}
+
+#[test]
+fn test_decrease_stream_deposit_respects_withdrawn_and_accrued_invariants() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // At t=500, accrued=500; withdraw 200.
+    ctx.env.ledger().set_timestamp(500);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 500);
+
+    // Now accrued==withdrawn==500. Decrease deposit to the accrued amount; refund 500.
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client()
+        .decrease_stream_deposit(&stream_id, &500_i128);
+    let sender_after = ctx.token().balance(&ctx.sender);
+
+    assert_eq!(sender_after - sender_before, 500);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, 500);
+    assert_eq!(state.withdrawn_amount, 500);
+}
+
+#[test]
+#[should_panic(expected = "new deposit must be >= currently accrued amount")]
+fn test_decrease_stream_deposit_rejects_below_accrued() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // At t=400, accrued=400.
+    ctx.env.ledger().set_timestamp(400);
+
+    // Attempt to set new deposit below accrued amount must panic.
+    ctx.client()
+        .decrease_stream_deposit(&stream_id, &399_i128);
+}
