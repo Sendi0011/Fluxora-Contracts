@@ -7221,3 +7221,65 @@ fn test_get_withdrawable_cancelled_stream_returns_accrued() {
         "withdrawable must equal frozen accrued amount on Cancelled stream"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests — update_rate_per_second
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_update_rate_per_second_increases_rate_and_preserves_accrual() {
+    let ctx = TestContext::setup();
+
+    // Create a stream with generous deposit so we can safely increase the rate.
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &10_000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1_000u64,
+    );
+
+    // Mid-stream, record accrued with the original rate.
+    ctx.env.ledger().set_timestamp(500);
+    let accrued_before = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_before, 500);
+
+    // Increase rate from 1 → 5 tokens/second.
+    ctx.client().update_rate_per_second(&stream_id, &5_i128);
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after.rate_per_second, 5);
+    assert_eq!(state_after.deposit_amount, 10_000);
+
+    // Accrued amount must be monotonically non-decreasing after the update.
+    let accrued_after = ctx.client().calculate_accrued(&stream_id);
+    assert!(
+        accrued_after >= accrued_before,
+        "accrued_after ({accrued_after}) must be >= accrued_before ({accrued_before})"
+    );
+}
+
+#[test]
+#[should_panic(expected = "new rate must be greater than current rate")]
+fn test_update_rate_per_second_rejects_non_increasing_rate() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Attempting to set the same rate should panic.
+    ctx.client().update_rate_per_second(&stream_id, &1_i128);
+}
+
+#[test]
+#[should_panic(expected = "deposit_amount must cover total streamable amount for new rate")]
+fn test_update_rate_per_second_rejects_rate_exceeding_deposit_coverage() {
+    let ctx = TestContext::setup();
+
+    // Default stream: deposit=1000, start=0, end=1000 ⇒ duration=1000s.
+    let stream_id = ctx.create_default_stream();
+
+    // New rate would require 2000 tokens over 1000 seconds, but deposit is only 1000.
+    ctx.client().update_rate_per_second(&stream_id, &2_i128);
+}
