@@ -90,6 +90,16 @@ pub struct Withdrawal {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct RateUpdated {
+    pub stream_id: u64,
+    pub old_rate_per_second: i128,
+    pub new_rate_per_second: i128,
+    /// Ledger timestamp when the rate update became effective.
+    pub effective_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Stream {
     pub stream_id: u64,
     pub sender: Address,
@@ -711,18 +721,8 @@ impl FluxoraStream {
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
         let unstreamed = stream.deposit_amount - accrued;
 
-        // REENTRANCY PROTECTION: state is updated and persisted before the token
-        // transfer executes. Soroban's execution model prevents true reentrancy,
-        // but we follow the checks-effects-interactions pattern as best practice.
-        // Assumption: the token contract does not reenter this contract.
-        stream.status = StreamStatus::Cancelled;
-        save_stream(&env, &stream);
-
-        // Transfer after state is saved
-        if unstreamed > 0 {
-            let token_client = token::Client::new(&env, &get_token(&env));
-            token_client.transfer(&env.current_contract_address(), &stream.sender, &unstreamed);
         // CEI: update state before external token transfer to reduce reentrancy risk.
+        // Assumption: the token contract does not reenter this contract.
         stream.status = StreamStatus::Cancelled;
         stream.cancelled_at = Some(env.ledger().timestamp());
         save_stream(&env, &stream);
@@ -811,13 +811,6 @@ impl FluxoraStream {
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
         let withdrawable = accrued - stream.withdrawn_amount;
 
-        // REENTRANCY PROTECTION: state is updated and persisted before the token
-        // transfer executes. Soroban's execution model prevents true reentrancy,
-        // but we follow the checks-effects-interactions pattern as best practice.
-        // Assumption: the token contract does not reenter this contract.
-        stream.withdrawn_amount += withdrawable;
-
-        if stream.withdrawn_amount >= stream.deposit_amount {
         // Handle zero withdrawable: return 0 without transfer or state change (idempotent).
         // This occurs before cliff or when all accrued funds have been withdrawn.
         // Frontends can safely call withdraw without checking balance first.
@@ -826,6 +819,7 @@ impl FluxoraStream {
         }
 
         // CEI: update state before external token transfer to reduce reentrancy risk.
+        // Assumption: the token contract does not reenter this contract.
         stream.withdrawn_amount += withdrawable;
         let completed_now = stream.withdrawn_amount == stream.deposit_amount;
         if completed_now {
@@ -833,17 +827,6 @@ impl FluxoraStream {
         }
         save_stream(&env, &stream);
 
-        // Transfer after state is saved
-        let token_client = token::Client::new(&env, &get_token(&env));
-        token_client.transfer(
-            &env.current_contract_address(),
-            &stream.recipient,
-            &withdrawable,
-        );
-
-        env.events()
-            .publish((symbol_short!("withdrew"), stream_id), withdrawable);
-        withdrawable
         push_token(&env, &stream.recipient, withdrawable);
 
         env.events().publish(
@@ -861,6 +844,7 @@ impl FluxoraStream {
                 StreamEvent::StreamCompleted(stream_id),
             );
         }
+
         Ok(withdrawable)
     }
 
@@ -1079,6 +1063,79 @@ impl FluxoraStream {
         read_stream_count(&env)
     }
 
+    /// Update the `rate_per_second` of an existing stream.
+    ///
+    /// This is a **forward-only** rate change that preserves all existing invariants:
+    ///
+    /// - The stream must be in `Active` or `Paused` state (not terminal).
+    /// - The caller must be the original stream sender.
+    /// - The new rate must be **strictly greater** than the current rate.
+    /// - The existing `deposit_amount` must still cover `new_rate × (end_time - start_time)`.
+    ///
+    /// Historical accrual is monotonic: at any given ledger time, the updated rate can
+    /// only increase (never decrease) the accrued amount relative to the previous rate.
+    /// This ensures the recipient's entitlement is never reduced by a rate update.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_rate_per_second`: New streaming rate in tokens per second (must be > current rate).
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    ///
+    /// # Events
+    /// - Emits a `rate_upd` event with a `RateUpdated` payload capturing old/new rate and effective time.
+    pub fn update_rate_per_second(
+        env: Env,
+        stream_id: u64,
+        new_rate_per_second: i128,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can update the rate.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only mutable (non-terminal) streams can be updated.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only update active or paused streams"
+        );
+
+        assert!(new_rate_per_second > 0, "new rate must be positive");
+
+        let old_rate = stream.rate_per_second;
+        // Forward-only semantics: disallow decreases.
+        assert!(
+            new_rate_per_second > old_rate,
+            "new rate must be greater than current rate"
+        );
+
+        // Validate that the existing deposit still covers the new total streamable amount.
+        let duration = (stream.end_time - stream.start_time) as i128;
+        let total_streamable = new_rate_per_second
+            .checked_mul(duration)
+            .expect("overflow calculating total streamable amount for new rate");
+        assert!(
+            stream.deposit_amount >= total_streamable,
+            "deposit_amount must cover total streamable amount for new rate"
+        );
+
+        stream.rate_per_second = new_rate_per_second;
+        save_stream(&env, &stream);
+
+        env.events().publish(
+            (symbol_short!("rate_upd"), stream_id),
+            RateUpdated {
+                stream_id,
+                old_rate_per_second: old_rate,
+                new_rate_per_second,
+                effective_time: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     /// Return the contract version number.
     ///
     /// Reads the compile-time `CONTRACT_VERSION` constant — no storage access required.
@@ -1166,18 +1223,8 @@ impl FluxoraStream {
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
         let unstreamed = stream.deposit_amount - accrued;
 
-        // REENTRANCY PROTECTION: state is updated and persisted before the token
-        // transfer executes. Soroban's execution model prevents true reentrancy,
-        // but we follow the checks-effects-interactions pattern as best practice.
-        // Assumption: the token contract does not reenter this contract.
-        stream.status = StreamStatus::Cancelled;
-        save_stream(&env, &stream);
-
-        // Transfer after state is saved
-        if unstreamed > 0 {
-            let token_client = token::Client::new(&env, &get_token(&env));
-            token_client.transfer(&env.current_contract_address(), &stream.sender, &unstreamed);
         // CEI: update state before external token transfer to reduce reentrancy risk.
+        // Assumption: the token contract does not reenter this contract.
         stream.status = StreamStatus::Cancelled;
         stream.cancelled_at = Some(env.ledger().timestamp());
         save_stream(&env, &stream);
