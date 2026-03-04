@@ -7345,3 +7345,55 @@ fn test_shorten_stream_end_time_rejects_past_end_time() {
     ctx.client()
         .shorten_stream_end_time(&stream_id, &500u64);
 }
+
+// ---------------------------------------------------------------------------
+// Tests — extend_stream_end_time
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_extend_stream_end_time_preserves_accrued_and_allows_longer_accrual() {
+    let ctx = TestContext::setup();
+
+    // Create a stream with extra deposit so it can be safely extended.
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2_000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1_000u64,
+    );
+
+    // At t=800, accrued should be 800.
+    ctx.env.ledger().set_timestamp(800);
+    let accrued_before = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_before, 800);
+
+    // Extend end_time from 1000 → 2000.
+    ctx.client()
+        .extend_stream_end_time(&stream_id, &2_000u64);
+
+    // Accrued at the same ledger timestamp (t=800) must remain unchanged.
+    let accrued_after = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_after, accrued_before);
+
+    // After extension, accrual continues linearly up to the new end_time.
+    ctx.env.ledger().set_timestamp(1_500);
+    let accrued_late = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_late, 1_500);
+}
+
+#[test]
+#[should_panic(expected = "deposit_amount must cover total streamable amount for extended schedule")]
+fn test_extend_stream_end_time_rejects_when_deposit_insufficient() {
+    let ctx = TestContext::setup();
+
+    // Default stream: deposit=1000, start=0, end=1000, rate=1.
+    let stream_id = ctx.create_default_stream();
+
+    // Extending to 2000 seconds would require 2000 tokens, but deposit is only 1000.
+    ctx.client()
+        .extend_stream_end_time(&stream_id, &2_000u64);
+}

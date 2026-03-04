@@ -109,6 +109,14 @@ pub struct StreamEndShortened {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct StreamEndExtended {
+    pub stream_id: u64,
+    pub old_end_time: u64,
+    pub new_end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Stream {
     pub stream_id: u64,
     pub sender: Address,
@@ -1247,6 +1255,98 @@ impl FluxoraStream {
                 old_end_time,
                 new_end_time,
                 refund_amount,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Extend a stream's `end_time` without changing its deposit or rate.
+    ///
+    /// This operation lengthens the schedule of an **Active** or **Paused** stream while:
+    ///
+    /// - Keeping the rate and deposit fixed.
+    /// - Ensuring the existing `deposit_amount` still safely covers the extended duration.
+    /// - Preserving accrued amount at the current ledger time.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_end_time`: New stream end timestamp (must be:
+    ///   - `> current end_time`
+    ///   - `> start_time`
+    ///   - `>= cliff_time`
+    ///   - `>= current_ledger_timestamp`).
+    ///
+    /// # Behaviour
+    /// - Validates `deposit_amount >= rate_per_second × (new_end_time - start_time)`.
+    /// - Updates `end_time` in-place; all other fields remain unchanged.
+    /// - Accrual at the current ledger time is unchanged; future accrual continues linearly.
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    ///
+    /// # Events
+    /// - Emits an `end_ext` event with a `StreamEndExtended` payload describing the change.
+    pub fn extend_stream_end_time(
+        env: Env,
+        stream_id: u64,
+        new_end_time: u64,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can modify the schedule.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only non-terminal streams may be extended.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only extend active or paused streams"
+        );
+
+        let now = env.ledger().timestamp();
+
+        // Must move end_time forward in time.
+        assert!(
+            new_end_time > stream.end_time,
+            "new end_time must be after existing end_time"
+        );
+
+        // Keep basic schedule invariants intact.
+        assert!(
+            new_end_time > stream.start_time,
+            "new end_time must be after start_time"
+        );
+        assert!(
+            new_end_time >= stream.cliff_time,
+            "new end_time must be >= cliff_time"
+        );
+        assert!(
+            new_end_time >= now,
+            "new end_time must be >= current ledger timestamp"
+        );
+
+        // Ensure existing deposit still covers the extended schedule at the current rate.
+        let new_duration = (new_end_time - stream.start_time) as i128;
+        let new_total_streamable = stream
+            .rate_per_second
+            .checked_mul(new_duration)
+            .expect("overflow calculating total streamable amount for extended schedule");
+
+        assert!(
+            new_total_streamable <= stream.deposit_amount,
+            "deposit_amount must cover total streamable amount for extended schedule"
+        );
+
+        let old_end_time = stream.end_time;
+        stream.end_time = new_end_time;
+        save_stream(&env, &stream);
+
+        env.events().publish(
+            (symbol_short!("end_ext"), stream_id),
+            StreamEndExtended {
+                stream_id,
+                old_end_time,
+                new_end_time,
             },
         );
 
