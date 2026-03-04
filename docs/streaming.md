@@ -159,6 +159,16 @@ return min(accrued, deposit_amount).max(0)
 withdrawable = accrued - withdrawn_amount
 ```
 
+### Frontend: get_claimable_at (simulation)
+
+`get_claimable_at(stream_id, timestamp)` is a read-only view that returns the amount that would be claimable (withdrawable) at an arbitrary timestamp. Use it for:
+
+- **Planning:** "How much will be claimable at time T?" without sending a transaction.
+- **Simulation:** Pass a future timestamp to show projected claimable amount.
+- **Consistency:** For the current ledger time, result matches `get_withdrawable(stream_id)`.
+
+Behaviour: Active/Paused streams use the given `timestamp` (clamped to schedule); Cancelled streams use `min(timestamp, cancelled_at)` so accrual is frozen at cancellation. Completed streams return 0.
+
 ---
 
 ## 3. Cliff and end_time Behavior
@@ -204,6 +214,8 @@ deposit_amount >= rate_per_second * (end_time - start_time)
 | `cancel_stream`          | Sender            | `sender.require_auth()`    |
 | `withdraw`               | Recipient         | `recipient.require_auth()` |
 | `calculate_accrued`      | Anyone            | None (view)                |
+| `get_withdrawable`       | Anyone            | None (view)                |
+| `get_claimable_at`       | Anyone            | None (view)                |
 | `get_config`             | Anyone            | None (view)                |
 | `get_stream_state`       | Anyone            | None (view)                |
 | `pause_stream_as_admin`  | Admin             | `admin.require_auth()`     |
