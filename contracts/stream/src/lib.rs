@@ -65,6 +65,7 @@ pub enum StreamEvent {
     Resumed(u64),
     StreamCancelled(u64),
     StreamCompleted(u64),
+    StreamClosed(u64),
 }
 
 #[contracttype]
@@ -95,6 +96,11 @@ pub struct WithdrawalTo {
     pub stream_id: u64,
     pub recipient: Address,
     pub destination: Address,
+/// Per-stream result for `batch_withdraw`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchWithdrawResult {
+    pub stream_id: u64,
     pub amount: i128,
 }
 
@@ -229,6 +235,11 @@ fn save_stream(env: &Env, stream: &Stream) {
         PERSISTENT_LIFETIME_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );
+}
+
+fn remove_stream(env: &Env, stream_id: u64) {
+    let key = DataKey::Stream(stream_id);
+    env.storage().persistent().remove(&key);
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +967,90 @@ impl FluxoraStream {
         }
 
         Ok(withdrawable)
+    /// Withdraw accrued tokens from multiple streams in one call (recipient-only).
+    ///
+    /// The caller must be the recipient of every stream in `stream_ids`. Each stream
+    /// is processed in order: same validation and accounting as `withdraw`. Events
+    /// are emitted per stream. The operation is atomic: if any stream fails
+    /// (e.g. not found, not recipient's, completed, or paused), the entire call panics
+    /// and no state changes or transfers occur.
+    ///
+    /// # Parameters
+    /// - `recipient`: Address that must authorize and must be the recipient of all streams
+    /// - `stream_ids`: Stream IDs to withdraw from (can contain duplicates; each processed once)
+    ///
+    /// # Returns
+    /// - `Vec<BatchWithdrawResult>`: Per-stream (stream_id, amount) for each withdrawal (amount may be 0)
+    ///
+    /// # Authorization
+    /// - Requires authorization from `recipient` once for the entire batch
+    ///
+    /// # Atomicity
+    /// - All streams are processed in order. Any panic (stream not found, wrong recipient,
+    ///   completed, paused) reverts the whole transaction.
+    pub fn batch_withdraw(
+        env: Env,
+        recipient: Address,
+        stream_ids: soroban_sdk::Vec<u64>,
+    ) -> Result<soroban_sdk::Vec<BatchWithdrawResult>, ContractError> {
+        recipient.require_auth();
+
+        let mut results = soroban_sdk::Vec::new(&env);
+
+        for stream_id in stream_ids.iter() {
+            let mut stream = load_stream(&env, stream_id)?;
+
+            assert!(
+                stream.recipient == recipient,
+                "stream recipient must match authorized recipient"
+            );
+
+            assert!(
+                stream.status != StreamStatus::Paused,
+                "cannot withdraw from paused stream"
+            );
+
+            let withdrawable = if stream.status == StreamStatus::Completed {
+                0
+            } else {
+                let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
+                (accrued - stream.withdrawn_amount).max(0)
+            };
+
+            if withdrawable > 0 {
+                stream.withdrawn_amount += withdrawable;
+                let completed_now = stream.withdrawn_amount == stream.deposit_amount;
+                if completed_now {
+                    stream.status = StreamStatus::Completed;
+                }
+                save_stream(&env, &stream);
+
+                push_token(&env, &stream.recipient, withdrawable);
+
+                env.events().publish(
+                    (symbol_short!("withdrew"), stream_id),
+                    Withdrawal {
+                        stream_id,
+                        recipient: stream.recipient.clone(),
+                        amount: withdrawable,
+                    },
+                );
+
+                if completed_now {
+                    env.events().publish(
+                        (symbol_short!("completed"), stream_id),
+                        StreamEvent::StreamCompleted(stream_id),
+                    );
+                }
+            }
+
+            results.push_back(BatchWithdrawResult {
+                stream_id,
+                amount: withdrawable,
+            });
+        }
+
+        Ok(results)
     }
 
     /// Calculate the total amount accrued to the recipient at the current time.
@@ -1442,6 +1537,60 @@ impl FluxoraStream {
                 new_end_time,
             },
         );
+
+        Ok(())
+    }
+
+    /// Return the contract version number.
+    ///
+    /// Reads the compile-time `CONTRACT_VERSION` constant — no storage access required.
+    /// Frontends and deployment scripts can call this to confirm which version of the
+    /// contract is currently deployed before interacting with it.
+    ///
+    /// # Returns
+    /// - `u32`: The current contract version (currently `1`)
+    ///
+    /// Close (archive) a completed stream to reduce long-term storage.
+    ///
+    /// Permanently removes the stream's persistent storage entry. Only streams in
+    /// `Completed` status can be closed; all payouts must already have been made.
+    /// After close, the stream is no longer queryable (`get_stream_state` returns
+    /// `StreamNotFound`).
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to close
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success
+    ///
+    /// # Preconditions
+    /// - Stream must exist and have status `Completed`
+    ///
+    /// # Panics
+    /// - If the stream does not exist
+    /// - If the stream is not `Completed` (Active, Paused, or Cancelled)
+    ///
+    /// # Events
+    /// - Publishes `closed(stream_id)` with `StreamEvent::StreamClosed(stream_id)` before removal
+    ///
+    /// # Operational guidance
+    /// - Callable by anyone; no authorization required (permissionless cleanup).
+    /// - Indexers and UIs should treat closed stream IDs as non-existent.
+    /// - Do not close streams that might still need historical data for accounting.
+    pub fn close_completed_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
+        let stream = load_stream(&env, stream_id)?;
+
+        assert!(
+            stream.status == StreamStatus::Completed,
+            "can only close completed streams"
+        );
+
+        env.events().publish(
+            (symbol_short!("closed"), stream_id),
+            StreamEvent::StreamClosed(stream_id),
+        );
+
+        remove_stream(&env, stream_id);
 
         Ok(())
     }
