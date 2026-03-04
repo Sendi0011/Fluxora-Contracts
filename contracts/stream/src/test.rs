@@ -7552,6 +7552,115 @@ fn test_get_withdrawable_cancelled_stream_returns_accrued() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — get_claimable_at (#221)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_claimable_at_stream_not_found() {
+    let ctx = TestContext::setup();
+    let result = ctx.client().try_get_claimable_at(&0, &100u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_get_claimable_at_before_cliff_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff at 500
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &100);
+    assert_eq!(claimable, 0, "claimable at t=100 (before cliff) must be 0");
+}
+
+#[test]
+fn test_get_claimable_at_at_cliff_boundary() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // start=0, cliff=500, end=1000, rate=1
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &500);
+    assert_eq!(
+        claimable, 500,
+        "at cliff time accrual starts from start_time"
+    );
+}
+
+#[test]
+fn test_get_claimable_at_at_end_boundary() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 0..1000, rate 1
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &1000);
+    assert_eq!(claimable, 1000, "at end_time claimable equals deposit");
+}
+
+#[test]
+fn test_get_claimable_at_after_end_capped() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &5000);
+    assert_eq!(
+        claimable, 1000,
+        "after end_time claimable capped at deposit"
+    );
+}
+
+#[test]
+fn test_get_claimable_at_after_partial_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id);
+
+    // At t=800: accrued 800, withdrawn 300 -> claimable 500
+    let claimable = ctx.client().get_claimable_at(&stream_id, &800);
+    assert_eq!(claimable, 500);
+}
+
+#[test]
+fn test_get_claimable_at_completed_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &1000);
+    assert_eq!(claimable, 0, "completed stream has nothing left to claim");
+}
+
+#[test]
+fn test_get_claimable_at_cancelled_frozen_at_cancel_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    // At timestamp 400: accrued was 400 (frozen), withdrawn 0 -> claimable 400
+    let claimable = ctx.client().get_claimable_at(&stream_id, &400);
+    assert_eq!(claimable, 400);
+
+    // At a future timestamp, claimable still 400 (accrual frozen)
+    let claimable_future = ctx.client().get_claimable_at(&stream_id, &9999);
+    assert_eq!(claimable_future, 400);
+}
+
+#[test]
+fn test_get_claimable_at_matches_get_withdrawable_at_current_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(600);
+    let withdrawable = ctx.client().get_withdrawable(&stream_id);
+    let claimable_at = ctx.client().get_claimable_at(&stream_id, &600);
+    assert_eq!(
+        withdrawable, claimable_at,
+        "get_claimable_at(now) should match get_withdrawable"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests — update_rate_per_second
 // ---------------------------------------------------------------------------
 

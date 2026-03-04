@@ -1148,6 +1148,66 @@ impl FluxoraStream {
         Ok(if withdrawable > 0 { withdrawable } else { 0 })
     }
 
+    /// Compute the claimable (withdrawable) amount at an arbitrary timestamp (read-only).
+    ///
+    /// Use this for simulation and planning: e.g. "how much could the recipient claim at
+    /// time T?" without mutating state or using the current ledger time.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream
+    /// - `timestamp`: Ledger timestamp at which to evaluate claimable amount
+    ///
+    /// # Returns
+    /// - `i128`: The amount that would be claimable (withdrawable) at the given timestamp.
+    ///   Returns `0` for Completed streams, before cliff, or when already fully withdrawn.
+    ///
+    /// # Behaviour
+    /// - **Active / Paused**: Accrual is computed at `timestamp` (clamped to stream schedule);
+    ///   claimable = `max(0, accrued_at_timestamp - withdrawn_amount)`.
+    /// - **Cancelled**: Accrual is frozen at cancellation; effective time is
+    ///   `min(timestamp, cancelled_at)`, then same formula.
+    /// - **Completed**: Returns `0` (nothing left to claim).
+    ///
+    /// # Errors
+    /// - `ContractError::StreamNotFound` if the stream does not exist
+    /// - `ContractError::InvalidState` if stream is Cancelled but `cancelled_at` is missing
+    ///
+    /// # Frontend usage
+    /// - Call with a future timestamp to show "claimable at T" for planning.
+    /// - Call with current ledger time to mirror `get_withdrawable` without state changes.
+    pub fn get_claimable_at(
+        env: Env,
+        stream_id: u64,
+        timestamp: u64,
+    ) -> Result<i128, ContractError> {
+        let stream = load_stream(&env, stream_id)?;
+
+        if stream.status == StreamStatus::Completed {
+            return Ok(0);
+        }
+
+        let effective_time = match stream.status {
+            StreamStatus::Cancelled => {
+                let at = stream.cancelled_at.ok_or(ContractError::InvalidState)?;
+                timestamp.min(at)
+            }
+            StreamStatus::Active | StreamStatus::Paused => timestamp,
+            StreamStatus::Completed => unreachable!("returned above"),
+        };
+
+        let accrued = accrual::calculate_accrued_amount(
+            stream.start_time,
+            stream.cliff_time,
+            stream.end_time,
+            stream.rate_per_second,
+            stream.deposit_amount,
+            effective_time,
+        );
+
+        let claimable = accrued - stream.withdrawn_amount;
+        Ok(if claimable > 0 { claimable } else { 0 })
+    }
+
     /// Retrieve the global contract configuration.
     ///
     /// Returns the contract's configuration containing the token address used for all
