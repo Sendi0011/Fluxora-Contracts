@@ -567,6 +567,28 @@ fn test_create_stream_emits_event() {
 }
 
 #[test]
+#[should_panic]
+fn test_create_stream_panics_when_contract_paused() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().set_contract_paused(&true);
+    ctx.client().create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+}
+
+#[test]
+fn test_create_stream_succeeds_after_unpause() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().set_contract_paused(&true);
+    ctx.client().set_contract_paused(&false);
+    let id = ctx
+        .client()
+        .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+    assert_eq!(id, 0);
+    assert_eq!(ctx.client().get_stream_state(&id).status, StreamStatus::Active);
+}
+
+#[test]
 fn test_withdraw_emits_event() {
     let ctx = TestContext::setup();
     ctx.env.ledger().set_timestamp(0);

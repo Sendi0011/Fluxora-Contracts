@@ -31,3 +31,4 @@ This table lists all possible errors in the FluxoraStream contract, including bo
 | `contract not initialised: missing config`     | Contract storage not initialized before access                                  | `get_config`, `get_token`, `get_admin` |
 | `InvalidState`                                  | Operation attempted on a stream in an invalid state (Paused, Completed, Cancelled) | `pause_stream`, `resume_stream`, `cancel_stream`, `withdraw` |
 | `InvalidParams`                                 | Function input parameters are invalid (generic catch-all for asserts)          | `create_stream` |
+| `ContractPaused` (error code 4)                 | Global pause active; creation blocked until admin calls `set_contract_paused(false)` | `create_stream`, `create_streams` |
