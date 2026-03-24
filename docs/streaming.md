@@ -246,6 +246,12 @@ If the existing deposit does not cover the extended duration, `extend_stream_end
 
 **Note:** Sender-managed functions (`pause_stream`, `resume_stream`, `cancel_stream`) require sender auth. Admin uses separate `_as_admin` entry points.
 
+### batch_withdraw: completed stream behavior
+
+`batch_withdraw` processes each stream ID in order. A stream with status `Completed` **does not panic** — it contributes a zero-amount result (`BatchWithdrawResult { stream_id, amount: 0 }`) and is skipped silently. No token transfer and no event are emitted for that entry. This allows callers to pass a mixed list of active and already-completed streams without pre-filtering.
+
+A `Paused` stream **does** panic and reverts the entire batch.
+
 ---
 
 ## 5. Events
@@ -320,8 +326,8 @@ errors relevant to stream creation and timing.
 | `"stream is completed"`                                                 | `resume_stream`                            | Resume completed             |
 | `"stream is cancelled"`                                                 | `resume_stream`                            | Resume cancelled             |
 | `"stream must be active or paused to cancel"`                           | `cancel_stream` / `cancel_stream_as_admin` | Cancel completed/cancelled   |
-| `"stream already completed"`                                            | `withdraw`                                 | Withdraw from completed      |
-| `"cannot withdraw from paused stream"`                                  | `withdraw`                                 | Withdraw while paused        |
+| `"stream already completed"`                                            | `withdraw`                                 | Withdraw from completed (`batch_withdraw` silently returns 0 instead) |
+| `"cannot withdraw from paused stream"`                                  | `withdraw` / `batch_withdraw`              | Withdraw while paused        |
 | `"nothing to withdraw"`                                                 | `withdraw`                                 | accrued == withdrawn_amount  |
 | `"stream is not active"`                                                | `pause_stream_as_admin`                    | Admin pause non-active       |
 | `"stream is not paused"`                                                | `resume_stream_as_admin`                   | Admin resume non-paused      |

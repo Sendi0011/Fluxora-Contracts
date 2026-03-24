@@ -1100,7 +1100,7 @@ impl FluxoraStream {
     /// The caller must be the recipient of every stream in `stream_ids`. Each stream
     /// is processed in order: same validation and accounting as `withdraw`. Events
     /// are emitted per stream. The operation is atomic: if any stream fails
-    /// (e.g. not found, not recipient's, completed, or paused), the entire call panics
+    /// (e.g. not found, wrong recipient, or paused), the entire call panics
     /// and no state changes or transfers occur.
     ///
     /// # Parameters
@@ -1108,14 +1108,21 @@ impl FluxoraStream {
     /// - `stream_ids`: Stream IDs to withdraw from (can contain duplicates; each processed once)
     ///
     /// # Returns
-    /// - `Vec<BatchWithdrawResult>`: Per-stream (stream_id, amount) for each withdrawal (amount may be 0)
+    /// - `Vec<BatchWithdrawResult>`: Per-stream `(stream_id, amount)` for each entry.
+    ///   `amount` is 0 for streams that are already `Completed` or have nothing to withdraw
+    ///   (before cliff, or accrued == withdrawn). No token transfer or event is emitted for
+    ///   those entries.
+    ///
+    /// # Completed streams
+    /// A `Completed` stream in the batch does **not** panic. It contributes a zero-amount
+    /// result and is skipped silently. This allows callers to pass a mixed list of active
+    /// and already-completed streams without pre-filtering.
     ///
     /// # Authorization
     /// - Requires authorization from `recipient` once for the entire batch
     ///
     /// # Atomicity
-    /// - All streams are processed in order. Any panic (stream not found, wrong recipient,
-    ///   completed, paused) reverts the whole transaction.
+    /// - Any panic (stream not found, wrong recipient, paused) reverts the whole transaction.
     pub fn batch_withdraw(
         env: Env,
         recipient: Address,

@@ -1812,3 +1812,79 @@ fn integration_extend_end_time_balance_conservation() {
         "total token supply must be conserved"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests — batch_withdraw: completed streams yield zero amounts
+// ---------------------------------------------------------------------------
+
+/// Mixed batch [completed, active, completed]: zero amounts for completed entries,
+/// correct transfer for active entry, balance conservation throughout.
+#[test]
+fn integration_batch_withdraw_completed_streams_yield_zero() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.create_default_stream(); // will be completed
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    ); // active
+    let id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    ); // will be completed
+
+    // Complete id0 and id2
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id0);
+    ctx.client().withdraw(&id2);
+
+    // id1 is still active at t=600
+    ctx.env.ledger().set_timestamp(600);
+
+    let total_before = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+
+    let mut ids = soroban_sdk::Vec::new(&ctx.env);
+    ids.push_back(id0);
+    ids.push_back(id1);
+    ids.push_back(id2);
+    let results = ctx.client().batch_withdraw(&ctx.recipient, &ids);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results.get(0).unwrap().amount,
+        0,
+        "completed id0 must yield 0"
+    );
+    assert_eq!(
+        results.get(1).unwrap().amount,
+        600,
+        "active id1 must yield 600"
+    );
+    assert_eq!(
+        results.get(2).unwrap().amount,
+        0,
+        "completed id2 must yield 0"
+    );
+
+    // Balance conservation
+    let total_after = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+    assert_eq!(total_after, total_before);
+
+    // Contract holds only the remaining 400 for id1
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 400);
+}

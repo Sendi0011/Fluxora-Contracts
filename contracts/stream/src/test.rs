@@ -2816,6 +2816,210 @@ fn stream_ids_vec(env: &Env, ids: &[u64]) -> soroban_sdk::Vec<u64> {
     v
 }
 
+// --- batch_withdraw: completed streams yield zero amounts ---
+
+/// A single completed stream in the batch returns amount=0, no transfer, no event.
+#[test]
+fn test_batch_withdraw_completed_stream_yields_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+
+    let recipient_before = ctx.token().balance(&ctx.recipient);
+    let contract_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    let results = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[stream_id]));
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap().stream_id, stream_id);
+    assert_eq!(
+        results.get(0).unwrap().amount,
+        0,
+        "completed stream must yield 0"
+    );
+
+    // No token transfer
+    assert_eq!(ctx.token().balance(&ctx.recipient), recipient_before);
+    assert_eq!(ctx.token().balance(&ctx.contract_id), contract_before);
+    // No new events
+    assert_eq!(ctx.env.events().all().len(), events_before);
+}
+
+/// Mixed batch: [active, completed, active] — completed entry is zero, others transfer.
+#[test]
+fn test_batch_withdraw_mixed_active_and_completed() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.create_default_stream(); // active
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    ); // will be completed
+    let id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    ); // active
+
+    // Complete id1
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id1);
+    assert_eq!(
+        ctx.client().get_stream_state(&id1).status,
+        StreamStatus::Completed
+    );
+
+    ctx.env.ledger().set_timestamp(1000);
+    let results = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id1, id2]));
+
+    assert_eq!(results.len(), 3);
+    // id0: accrued=1000, withdrawn=0 → amount=1000
+    assert_eq!(results.get(0).unwrap().amount, 1000);
+    // id1: Completed → amount=0
+    assert_eq!(results.get(1).unwrap().amount, 0);
+    // id2: accrued=1000, withdrawn=0 → amount=1000
+    assert_eq!(results.get(2).unwrap().amount, 1000);
+
+    assert_eq!(ctx.token().balance(&ctx.recipient), 1000 + 1000 + 1000); // 1000 from earlier + 2000 now
+}
+
+/// All streams in batch are completed — all results are zero, no transfers, no events.
+#[test]
+fn test_batch_withdraw_all_completed_all_zero() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.create_default_stream();
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Complete both
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id0);
+    ctx.client().withdraw(&id1);
+
+    let recipient_before = ctx.token().balance(&ctx.recipient);
+    let events_before = ctx.env.events().all().len();
+
+    let results = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id1]));
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0).unwrap().amount, 0);
+    assert_eq!(results.get(1).unwrap().amount, 0);
+
+    assert_eq!(ctx.token().balance(&ctx.recipient), recipient_before);
+    assert_eq!(ctx.env.events().all().len(), events_before);
+}
+
+/// Completed stream in batch does NOT panic — the whole batch succeeds.
+#[test]
+fn test_batch_withdraw_completed_stream_does_not_panic() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    // Must not panic
+    let result = ctx
+        .client()
+        .try_batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[stream_id]));
+    assert!(result.is_ok(), "completed stream in batch must not panic");
+}
+
+/// Completed stream state is unchanged after batch_withdraw (no double-spend).
+#[test]
+fn test_batch_withdraw_completed_stream_state_unchanged() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state_before = ctx.client().get_stream_state(&stream_id);
+
+    ctx.client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[stream_id]));
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after.status, StreamStatus::Completed);
+    assert_eq!(state_after.withdrawn_amount, state_before.withdrawn_amount);
+    assert_eq!(state_after.deposit_amount, state_before.deposit_amount);
+}
+
+/// Paused stream in batch panics (contrast with completed which does not).
+#[test]
+#[should_panic(expected = "cannot withdraw from paused stream")]
+fn test_batch_withdraw_paused_stream_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().pause_stream(&stream_id);
+
+    ctx.client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[stream_id]));
+}
+
+/// batch_withdraw on a stream completed mid-batch: the stream that just completed
+/// contributes its final amount; a second pass on the same id yields zero.
+#[test]
+fn test_batch_withdraw_stream_completes_mid_batch_second_pass_zero() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.create_default_stream(); // 1000 tokens, 1000s
+
+    // Withdraw all at end — stream becomes Completed
+    ctx.env.ledger().set_timestamp(1000);
+    let results = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0]));
+    assert_eq!(results.get(0).unwrap().amount, 1000);
+    assert_eq!(
+        ctx.client().get_stream_state(&id0).status,
+        StreamStatus::Completed
+    );
+
+    // Second batch call on the now-completed stream yields zero
+    let results2 = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0]));
+    assert_eq!(results2.get(0).unwrap().amount, 0);
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 0);
+}
+
 #[test]
 fn test_batch_withdraw_multiple_streams() {
     let ctx = TestContext::setup();
