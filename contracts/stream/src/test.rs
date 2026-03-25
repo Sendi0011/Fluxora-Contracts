@@ -10322,6 +10322,456 @@ fn test_extend_end_time_cancelled_stream_rejected() {
     ctx.client().extend_stream_end_time(&stream_id, &2000u64);
 }
 
+/// Stream created at t=0 with cliff at t=0 (no cliff): index is updated immediately.
+#[test]
+fn test_get_recipient_streams_no_cliff_indexed_at_creation() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Index must reflect the stream before any time passes.
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams.get(0).unwrap(), id);
+}
+
+/// Stream with cliff: index is populated at creation, not at cliff time.
+/// The index tracks existence, not withdrawability.
+#[test]
+fn test_get_recipient_streams_cliff_stream_indexed_before_cliff() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_cliff_stream(); // cliff at t=500
+
+    // Before cliff: stream is in index even though nothing is withdrawable yet.
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams.get(0).unwrap(), id);
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 1);
+
+    // Confirm nothing is withdrawable before cliff.
+    ctx.env.ledger().set_timestamp(499);
+    assert_eq!(ctx.client().get_withdrawable(&id), 0);
+}
+
+/// Stream with cliff: still in index at exactly cliff time.
+#[test]
+fn test_get_recipient_streams_cliff_stream_indexed_at_cliff() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_cliff_stream(); // cliff at t=500
+
+    ctx.env.ledger().set_timestamp(500);
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams.get(0).unwrap(), id);
+}
+
+/// Stream cancelled exactly at start_time (before any accrual): stays in index.
+#[test]
+fn test_get_recipient_streams_cancel_at_start_time_stays_in_index() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream(); // start=0, end=1000
+
+    // Cancel immediately at start (0 accrued, full refund to sender).
+    ctx.client().cancel_stream(&id);
+
+    let state = ctx.client().get_stream_state(&id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(0));
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(
+        streams.len(),
+        1,
+        "stream cancelled at start must remain in index"
+    );
+}
+
+/// Stream cancelled before cliff: accrual is frozen at 0, stream stays in index.
+#[test]
+fn test_get_recipient_streams_cancel_before_cliff_frozen_accrual() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_cliff_stream(); // cliff=500, end=1000
+
+    // Cancel at t=200 (before cliff).
+    ctx.env.ledger().set_timestamp(200);
+    ctx.client().cancel_stream(&id);
+
+    // Accrual is frozen at cancellation time; before cliff so accrued=0.
+    let accrued = ctx.client().calculate_accrued(&id);
+    assert_eq!(accrued, 0, "accrued must be 0 when cancelled before cliff");
+
+    // Stream still in index (recipient can query it).
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 1);
+}
+
+/// Stream cancelled after cliff: accrual is frozen at cancellation timestamp.
+/// Index still contains the stream so recipient can withdraw the frozen amount.
+#[test]
+fn test_get_recipient_streams_cancel_after_cliff_frozen_accrual_in_index() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_cliff_stream(); // cliff=500, rate=1, end=1000
+
+    // Cancel at t=700 (after cliff, partial accrual).
+    ctx.env.ledger().set_timestamp(700);
+    ctx.client().cancel_stream(&id);
+
+    // Accrual frozen at t=700: 700 tokens accrued (rate=1, start=0).
+    let accrued = ctx.client().calculate_accrued(&id);
+    assert_eq!(accrued, 700, "accrued must be frozen at cancellation time");
+
+    // Stream in index so recipient can still withdraw.
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+
+    // Advancing time must NOT change the frozen accrual.
+    ctx.env.ledger().set_timestamp(9999);
+    let accrued_later = ctx.client().calculate_accrued(&id);
+    assert_eq!(
+        accrued_later, 700,
+        "cancelled stream accrual must not grow after cancellation"
+    );
+}
+
+/// Stream cancelled exactly at end_time: full deposit accrued, frozen, stays in index.
+#[test]
+fn test_get_recipient_streams_cancel_at_end_time_full_accrual() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream(); // rate=1, deposit=1000, end=1000
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().cancel_stream(&id);
+
+    let accrued = ctx.client().calculate_accrued(&id);
+    assert_eq!(
+        accrued, 1000,
+        "full deposit must be accrued when cancelled at end_time"
+    );
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+}
+
+/// Stream cancelled past end_time: accrual capped at deposit, stays in index.
+#[test]
+fn test_get_recipient_streams_cancel_past_end_time_capped_accrual() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream(); // deposit=1000, end=1000
+
+    ctx.env.ledger().set_timestamp(2000); // well past end
+    ctx.client().cancel_stream(&id);
+
+    let accrued = ctx.client().calculate_accrued(&id);
+    assert_eq!(
+        accrued, 1000,
+        "accrual must be capped at deposit even when cancelled past end"
+    );
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+}
+
+// --- create_streams (batch) updates the index ---
+
+/// Batch create_streams must add all streams to the recipient's index.
+#[test]
+fn test_get_recipient_streams_batch_create_updates_index() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let params = soroban_sdk::Vec::from_array(
+        &ctx.env,
+        [
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: 500,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 500,
+            },
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: 1000,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 1000,
+            },
+        ],
+    );
+
+    let ids = ctx.client().create_streams(&ctx.sender, &params);
+    assert_eq!(ids.len(), 2);
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(
+        streams.len(),
+        2,
+        "batch create must add all streams to index"
+    );
+    assert_eq!(streams.get(0).unwrap(), ids.get(0).unwrap());
+    assert_eq!(streams.get(1).unwrap(), ids.get(1).unwrap());
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 2);
+}
+
+/// Batch create_streams to different recipients: each recipient's index is independent.
+#[test]
+fn test_get_recipient_streams_batch_create_separate_recipient_indices() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let recipient2 = Address::generate(&ctx.env);
+
+    let params = soroban_sdk::Vec::from_array(
+        &ctx.env,
+        [
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: 500,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 500,
+            },
+            CreateStreamParams {
+                recipient: recipient2.clone(),
+                deposit_amount: 1000,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 1000,
+            },
+        ],
+    );
+
+    let ids = ctx.client().create_streams(&ctx.sender, &params);
+
+    let streams1 = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams1.len(), 1);
+    assert_eq!(streams1.get(0).unwrap(), ids.get(0).unwrap());
+
+    let streams2 = ctx.client().get_recipient_streams(&recipient2);
+    assert_eq!(streams2.len(), 1);
+    assert_eq!(streams2.get(0).unwrap(), ids.get(1).unwrap());
+}
+
+// --- Sorted order invariant ---
+
+/// After interleaved creates and closes, the remaining IDs are always sorted ascending.
+#[test]
+fn test_get_recipient_streams_sorted_after_interleaved_close() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Create streams 0, 1, 2, 3
+    for _ in 0..4 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+    }
+
+    // Complete and close stream 1 (middle).
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&1u64);
+    ctx.client().close_completed_stream(&1u64);
+
+    // Complete and close stream 3 (last).
+    ctx.client().withdraw(&3u64);
+    ctx.client().close_completed_stream(&3u64);
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 2);
+    // Must be sorted: [0, 2]
+    assert_eq!(streams.get(0).unwrap(), 0u64);
+    assert_eq!(streams.get(1).unwrap(), 2u64);
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 2);
+}
+
+// --- Count / list consistency ---
+
+/// get_recipient_stream_count always equals get_recipient_streams().len().
+#[test]
+fn test_get_recipient_stream_count_matches_list_len() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Empty
+    assert_eq!(
+        ctx.client().get_recipient_stream_count(&ctx.recipient),
+        ctx.client().get_recipient_streams(&ctx.recipient).len() as u64,
+    );
+
+    // After 3 creates
+    for _ in 0..3 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+    }
+    assert_eq!(
+        ctx.client().get_recipient_stream_count(&ctx.recipient),
+        ctx.client().get_recipient_streams(&ctx.recipient).len() as u64,
+    );
+
+    // After close
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&0u64);
+    ctx.client().close_completed_stream(&0u64);
+    assert_eq!(
+        ctx.client().get_recipient_stream_count(&ctx.recipient),
+        ctx.client().get_recipient_streams(&ctx.recipient).len() as u64,
+    );
+}
+
+/// Closing the only stream leaves count=0 and an empty list.
+#[test]
+fn test_get_recipient_stream_count_zero_after_only_stream_closed() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id);
+    ctx.client().close_completed_stream(&id);
+
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 0);
+    assert_eq!(ctx.client().get_recipient_streams(&ctx.recipient).len(), 0);
+}
+
+// --- IDs in list correspond to real, queryable streams ---
+
+/// Every ID returned by get_recipient_streams must resolve via get_stream_state
+/// and have the correct recipient field.
+#[test]
+fn test_get_recipient_streams_ids_resolve_to_correct_recipient() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    for _ in 0..5 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+    }
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    for id in streams.iter() {
+        let state = ctx.client().get_stream_state(&id);
+        assert_eq!(
+            state.recipient, ctx.recipient,
+            "stream {id} must have the queried recipient"
+        );
+        assert_eq!(
+            state.stream_id, id,
+            "stream_id field must match the index entry"
+        );
+    }
+}
+
+// --- Numeric boundary: single-second stream ---
+
+/// A stream with duration=1 second is indexed and removed correctly.
+#[test]
+fn test_get_recipient_streams_single_second_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1u64,
+    );
+
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 1);
+
+    // Complete and close.
+    ctx.env.ledger().set_timestamp(1);
+    ctx.client().withdraw(&id);
+    ctx.client().close_completed_stream(&id);
+
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 0);
+    assert_eq!(ctx.client().get_recipient_streams(&ctx.recipient).len(), 0);
+}
+
+// --- Admin cancel does not remove from index ---
+
+/// Admin-cancelled stream stays in the index (recipient must still be able to withdraw accrued).
+#[test]
+fn test_get_recipient_streams_admin_cancel_stays_in_index() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream_as_admin(&id);
+
+    let state = ctx.client().get_stream_state(&id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(
+        streams.len(),
+        1,
+        "admin-cancelled stream must remain in index"
+    );
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 1);
+}
+
+// --- Withdraw-to does not affect index ---
+
+/// withdraw_to does not remove the stream from the index.
+#[test]
+fn test_get_recipient_streams_withdraw_to_does_not_affect_index() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    let destination = Address::generate(&ctx.env);
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw_to(&id, &destination);
+
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1, "withdraw_to must not affect the index");
+    assert_eq!(ctx.client().get_recipient_stream_count(&ctx.recipient), 1);
+}
+
 /// new_end_time <= current end_time must be rejected.
 #[test]
 #[should_panic(expected = "new end_time must be after existing end_time")]
