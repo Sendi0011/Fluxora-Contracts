@@ -1475,6 +1475,9 @@ impl FluxoraStream {
             .instance()
             .set(&DataKey::GlobalPaused, &paused);
         bump_instance_ttl(&env);
+
+        env.events()
+            .publish((Symbol::new(&env, "paused_ctl"),), paused);
     }
 
     /// Retrieve the complete state of a payment stream.

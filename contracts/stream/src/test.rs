@@ -650,32 +650,6 @@ fn test_create_stream_emits_event() {
 }
 
 #[test]
-#[should_panic]
-fn test_create_stream_panics_when_contract_paused() {
-    let ctx = TestContext::setup();
-    ctx.env.ledger().set_timestamp(0);
-    ctx.client().set_contract_paused(&true);
-    ctx.client()
-        .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
-}
-
-#[test]
-fn test_create_stream_succeeds_after_unpause() {
-    let ctx = TestContext::setup();
-    ctx.env.ledger().set_timestamp(0);
-    ctx.client().set_contract_paused(&true);
-    ctx.client().set_contract_paused(&false);
-    let id = ctx
-        .client()
-        .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
-    assert_eq!(id, 0);
-    assert_eq!(
-        ctx.client().get_stream_state(&id).status,
-        StreamStatus::Active
-    );
-}
-
-#[test]
 fn test_withdraw_emits_event() {
     let ctx = TestContext::setup();
     ctx.env.ledger().set_timestamp(0);
@@ -10666,4 +10640,188 @@ fn test_extend_end_time_integration_full_withdrawal() {
     assert_eq!(state.withdrawn_amount, 2000);
     assert_eq!(ctx.token().balance(&ctx.contract_id), 0);
     assert_eq!(ctx.token().balance(&ctx.recipient), 2000);
+}
+
+// ===========================================================================
+// set_contract_paused: admin-only governance toggle (Issue #272)
+// ===========================================================================
+
+/// Verify `set_contract_paused` emits the `ContractPaused` event with correct boolean payload.
+#[test]
+fn test_set_contract_paused_emits_event() {
+    let ctx = TestContext::setup();
+
+    // Toggle pause to true
+    ctx.client().set_contract_paused(&true);
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    let topic_sym = soroban_sdk::Symbol::try_from_val(&ctx.env, &event.1.get(0).unwrap()).unwrap();
+    assert_eq!(topic_sym, soroban_sdk::Symbol::new(&ctx.env, "paused_ctl"));
+    let payload = bool::try_from_val(&ctx.env, &event.2).unwrap();
+    assert!(payload);
+
+    // Toggle pause to false
+    ctx.client().set_contract_paused(&false);
+    let events2 = ctx.env.events().all();
+    let event2 = events2.last().unwrap();
+    let topic_sym2 =
+        soroban_sdk::Symbol::try_from_val(&ctx.env, &event2.1.get(0).unwrap()).unwrap();
+    assert_eq!(topic_sym2, soroban_sdk::Symbol::new(&ctx.env, "paused_ctl"));
+    let payload2 = bool::try_from_val(&ctx.env, &event2.2).unwrap();
+    assert!(!payload2);
+}
+
+/// Admin can change pause state; non-admin trap during authorization.
+#[test]
+fn test_set_contract_paused_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token, &admin);
+
+    // Reset auth mock, test authorized caller
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_contract_paused",
+            args: (true,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.set_contract_paused(&true); // succeeds
+}
+
+#[test]
+#[should_panic]
+fn test_set_contract_paused_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token, &admin);
+
+    // Non-admin trap
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_contract_paused",
+            args: (false,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // This will panic due to auth trap
+    client.set_contract_paused(&false);
+}
+
+/// Calling create_stream while paused returns ContractPaused error.
+#[test]
+fn test_create_stream_fails_when_paused() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().set_contract_paused(&true);
+
+    let res = ctx
+        .client()
+        .try_create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        ContractError::ContractPaused.into()
+    );
+}
+
+/// Calling create_streams while paused returns ContractPaused error.
+#[test]
+fn test_create_streams_fails_when_paused() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().set_contract_paused(&true);
+
+    let params = CreateStreamParams {
+        recipient: ctx.recipient.clone(),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let batch = soroban_sdk::vec![&ctx.env, params];
+    let res = ctx.client().try_create_streams(&ctx.sender, &batch);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        ContractError::ContractPaused.into()
+    );
+}
+
+/// Unpausing restores create functionality.
+#[test]
+fn test_create_stream_succeeds_after_unpause() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Pause limits it
+    ctx.client().set_contract_paused(&true);
+    let res = ctx
+        .client()
+        .try_create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        ContractError::ContractPaused.into()
+    );
+
+    // Unpause restores it
+    ctx.client().set_contract_paused(&false);
+    let id = ctx
+        .client()
+        .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+    assert_eq!(id, 0);
+    assert_eq!(
+        ctx.client().get_stream_state(&id).status,
+        StreamStatus::Active
+    );
+}
+
+/// Global pause does NOT affect existing streams (withdraw, cancel, pause).
+#[test]
+fn test_global_pause_does_not_affect_existing_streams() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx
+        .client()
+        .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+
+    // Now trigger global pause
+    ctx.client().set_contract_paused(&true);
+
+    // Fast forward to enable withdrawal
+    ctx.env.ledger().set_timestamp(500);
+
+    // withdraw should succeed
+    let w_amount = ctx.client().withdraw(&id);
+    assert_eq!(w_amount, 500);
+
+    // sender pause_stream should succeed
+    ctx.client().pause_stream(&id);
+    assert_eq!(
+        ctx.client().get_stream_state(&id).status,
+        StreamStatus::Paused
+    );
+
+    // sender cancel_stream should succeed
+    ctx.client().cancel_stream(&id);
+    assert_eq!(
+        ctx.client().get_stream_state(&id).status,
+        StreamStatus::Cancelled
+    );
 }

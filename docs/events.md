@@ -28,6 +28,7 @@ Notes:
 | StreamEndExtended | `["end_ext", stream_id: u64]`  | `StreamEndExtended { stream_id: u64, old_end_time: u64, new_end_time: u64 }`                                                                              | When `extend_stream_end_time` successfully extends a stream.                                                             |
 | StreamToppedUp   | `["top_up", stream_id: u64]`    | `StreamToppedUp { stream_id: u64, top_up_amount: i128, new_deposit_amount: i128 }`                                                                        | When `top_up_stream` successfully increases a stream's deposit.                                                          |
 | AdminUpdated     | `["AdminUpdated"]`              | `(old_admin: Address, new_admin: Address)`                                                                                                                | When the contract admin is rotated via `set_admin`.                                                                     |
+| ContractPaused   | `["paused_ctl"]`                | `bool`                                                                                                                                                    | When the global contract pause state is toggled via `set_contract_paused`.                                              |
 
 ---
 | Event name | Topic(s) | Data (shape & types) | When emitted |
@@ -38,6 +39,7 @@ Notes:
 | StreamResumed | ["resumed", stream_id] | StreamEvent::Resumed(stream_id) — enum wrapper containing the u64 stream id | When a paused stream is resumed by the sender or admin.
 | StreamCancelled | ["cancelled", stream_id] | StreamEvent::StreamCancelled(stream_id) — enum wrapper containing the u64 stream id | When a stream is cancelled by the sender or admin.
 | AdminUpdated | ["admin", "updated"] | (old_admin: Address, new_admin: Address) | When contract admin is rotated via `set_admin`.
+| ContractPaused | ["paused_ctl"] | bool | When global pause is set to true or false.
 
 ## Exact Soroban event structure
 
@@ -280,6 +282,7 @@ Commit message suggestion: `docs: add event schema and topics for indexers`
 | `extend_stream_end_time`                                     | `"end_ext"`     |
 | `top_up_stream`                                              | `"top_up"`      |
 | `set_admin`                                                  | `"AdminUpdated"`|
+| `set_contract_paused`                                        | `"paused_ctl"`  |
 
 If you change event topics or payloads in the contract, update this document and
 include updated example snapshots in the PR.
