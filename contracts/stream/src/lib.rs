@@ -325,14 +325,10 @@ fn add_stream_to_recipient_index(env: &Env, recipient: &Address, stream_id: u64)
     let mut streams = load_recipient_streams(env, recipient);
 
     // Insert in sorted order (binary search for insertion point)
-    let mut insert_pos: u32 = 0;
-    for (i, id) in streams.iter().enumerate() {
-        if id > stream_id {
-            insert_pos = i as u32;
-            break;
-        }
-        insert_pos = (i + 1) as u32;
-    }
+    let insert_pos = match streams.binary_search(stream_id) {
+        Ok(pos) => pos,
+        Err(pos) => pos,
+    };
 
     streams.insert(insert_pos, stream_id);
     save_recipient_streams(env, recipient, &streams);
@@ -343,15 +339,7 @@ fn remove_stream_from_recipient_index(env: &Env, recipient: &Address, stream_id:
     let mut streams = load_recipient_streams(env, recipient);
 
     // Find and remove the stream_id
-    let mut found_index = None;
-    for (i, id) in streams.iter().enumerate() {
-        if id == stream_id {
-            found_index = Some(i as u32);
-            break;
-        }
-    }
-
-    if let Some(idx) = found_index {
+    if let Ok(idx) = streams.binary_search(stream_id) {
         streams.remove(idx);
         save_recipient_streams(env, recipient, &streams);
     }
