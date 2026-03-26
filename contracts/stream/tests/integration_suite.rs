@@ -7,7 +7,7 @@ use soroban_sdk::log;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Env, FromVal, IntoVal,
+    vec, Address, Env, FromVal, IntoVal, TryFromVal,
 };
 
 struct TestContext<'a> {
@@ -2838,4 +2838,539 @@ fn integration_create_streams_single_token_pull_equals_sum() {
     // Total pulled = 1000 + 2000 + 500 = 3500
     assert_eq!(ctx.token.balance(&ctx.sender), sender_before - 3500);
     assert_eq!(ctx.token.balance(&ctx.contract_id), 3500);
+}
+
+// ===========================================================================
+// i128 boundary streams: near-max rate/deposit scenarios — integration tests
+//
+// These tests exercise the full contract stack (token transfers, state
+// persistence, event emission) at i128-scale values.
+//
+// Audit notes:
+// - Token supply: the SAC mock has no supply cap; on mainnet the token's own
+//   supply is the binding constraint.
+// - Gas: Soroban budget is not enforced in the test harness.
+// - Rate × duration overflow at creation is rejected with InvalidParams.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 1. Creation and state persistence at near-max scale
+// ---------------------------------------------------------------------------
+
+/// Near-max deposit stream: stored fields match supplied params exactly.
+#[test]
+fn i128_boundary_creation_persists_correct_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2; // rate * 1 = deposit
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    let state = client.get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, deposit);
+    assert_eq!(state.rate_per_second, rate);
+    assert_eq!(state.withdrawn_amount, 0);
+    assert_eq!(state.status, StreamStatus::Active);
+    assert_eq!(state.start_time, 0);
+    assert_eq!(state.end_time, 1);
+    assert!(state.cancelled_at.is_none());
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&contract_id), deposit);
+    assert_eq!(token.balance(&sender), 0);
+}
+
+/// StreamCreated event at near-max carries correct payload.
+#[test]
+fn i128_boundary_creation_event_payload_correct() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    let events = env.events().all();
+    let last = events.last().unwrap();
+    // Verify topic: ("created", stream_id)
+    let topic0 = soroban_sdk::Symbol::from_val(&env, &last.1.get(0).unwrap());
+    assert_eq!(topic0, soroban_sdk::Symbol::new(&env, "created"));
+    let topic1: u64 = last.1.get(1).unwrap().into_val(&env);
+    assert_eq!(topic1, stream_id);
+    // Verify payload fields via the exported StreamCreated type
+    let payload = fluxora_stream::StreamCreated::try_from_val(&env, &last.2).unwrap();
+    assert_eq!(payload.stream_id, stream_id);
+    assert_eq!(payload.deposit_amount, deposit);
+    assert_eq!(payload.rate_per_second, rate);
+    assert_eq!(payload.start_time, 0);
+    assert_eq!(payload.end_time, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Accrual correctness at near-max scale
+// ---------------------------------------------------------------------------
+
+/// At t=0, accrued is 0 for near-max deposit.
+#[test]
+fn i128_boundary_accrued_zero_at_start() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    assert_eq!(client.calculate_accrued(&stream_id), 0);
+}
+
+/// At end_time, accrued == deposit for near-max stream.
+#[test]
+fn i128_boundary_accrued_equals_deposit_at_end() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    env.ledger().set_timestamp(1);
+    assert_eq!(client.calculate_accrued(&stream_id), deposit);
+}
+
+/// Long after end_time, accrued is still capped at deposit.
+#[test]
+fn i128_boundary_accrued_capped_long_after_end() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    env.ledger().set_timestamp(u64::MAX / 2);
+    assert_eq!(client.calculate_accrued(&stream_id), deposit);
+}
+
+/// Before cliff, accrued is 0 at near-max scale.
+#[test]
+fn i128_boundary_accrued_zero_before_cliff() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 1_000_000;
+    let rate: i128 = deposit / 1_000;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &500u64, &1_000u64,
+    );
+
+    env.ledger().set_timestamp(499);
+    assert_eq!(client.calculate_accrued(&stream_id), 0, "must be 0 before cliff");
+}
+
+// ---------------------------------------------------------------------------
+// 3. Full withdrawal at near-max scale
+// ---------------------------------------------------------------------------
+
+/// Full withdrawal of near-max deposit: balances correct, status Completed.
+#[test]
+fn i128_boundary_full_withdrawal_completes_stream() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+    let token = TokenClient::new(&env, &token_id);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    env.ledger().set_timestamp(1);
+    let withdrawn = client.withdraw(&stream_id);
+
+    assert_eq!(withdrawn, deposit);
+    assert_eq!(token.balance(&recipient), deposit);
+    assert_eq!(token.balance(&contract_id), 0);
+
+    let state = client.get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+    assert_eq!(state.withdrawn_amount, deposit);
+}
+
+/// Withdrawal event at near-max carries correct amount.
+#[test]
+fn i128_boundary_withdrawal_event_amount_correct() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    let rate: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1u64,
+    );
+
+    env.ledger().set_timestamp(1);
+    client.withdraw(&stream_id);
+
+    let events = env.events().all();
+    let withdrew_event = events.iter().rev().find(|e| {
+        if e.0 != contract_id { return false; }
+        let topic0 = soroban_sdk::Symbol::from_val(&env, &e.1.get(0).unwrap());
+        topic0 == soroban_sdk::Symbol::new(&env, "withdrew")
+    });
+    assert!(withdrew_event.is_some(), "withdrew event must be emitted");
+    let payload = fluxora_stream::Withdrawal::try_from_val(
+        &env, &withdrew_event.unwrap().2
+    ).unwrap();
+    assert_eq!(payload.amount, deposit);
+    assert_eq!(payload.stream_id, stream_id);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Cancellation at near-max scale
+// ---------------------------------------------------------------------------
+
+/// Cancel at midpoint: refund + frozen_accrued == deposit (invariant).
+#[test]
+fn i128_boundary_cancel_midpoint_invariant() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 1_000_000;
+    let rate: i128 = deposit / 1_000;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+    let token = TokenClient::new(&env, &token_id);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1_000u64,
+    );
+
+    env.ledger().set_timestamp(500);
+    client.cancel_stream(&stream_id);
+
+    let accrued = 500_i128 * rate;
+    let refund = deposit - accrued;
+
+    assert_eq!(token.balance(&sender), refund, "sender gets unstreamed refund");
+    assert_eq!(token.balance(&contract_id), accrued, "contract holds frozen accrued");
+    assert_eq!(refund + accrued, deposit, "refund + accrued == deposit");
+
+    let state = client.get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(500));
+}
+
+/// Cancelled stream: accrual is frozen, does not grow after cancellation.
+#[test]
+fn i128_boundary_cancelled_accrual_frozen() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 1_000_000;
+    let rate: i128 = deposit / 1_000;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1_000u64,
+    );
+
+    env.ledger().set_timestamp(300);
+    client.cancel_stream(&stream_id);
+    let frozen = client.calculate_accrued(&stream_id);
+
+    env.ledger().set_timestamp(999_999);
+    let later = client.calculate_accrued(&stream_id);
+    assert_eq!(later, frozen, "accrual must not grow after cancellation");
+}
+
+/// Recipient can withdraw frozen accrued after cancellation; status stays Cancelled.
+#[test]
+fn i128_boundary_recipient_withdraws_after_cancel_status_stays_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 1_000_000;
+    let rate: i128 = deposit / 1_000;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+    let token = TokenClient::new(&env, &token_id);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &1_000u64,
+    );
+
+    env.ledger().set_timestamp(700);
+    client.cancel_stream(&stream_id);
+    let frozen = 700_i128 * rate;
+
+    let withdrawn = client.withdraw(&stream_id);
+    assert_eq!(withdrawn, frozen);
+    assert_eq!(token.balance(&recipient), frozen);
+    assert_eq!(client.get_stream_state(&stream_id).status, StreamStatus::Cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Overflow rejection at creation
+// ---------------------------------------------------------------------------
+
+/// rate * duration overflows i128 → InvalidParams, no state change, no token movement.
+#[test]
+fn i128_boundary_rate_duration_overflow_rejected_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let deposit: i128 = i128::MAX / 2;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+    let token = TokenClient::new(&env, &token_id);
+
+    env.ledger().set_timestamp(0);
+    let count_before = client.get_stream_count();
+    let balance_before = token.balance(&sender);
+
+    // rate = i128::MAX/2, duration = 3 → product overflows
+    let result = client.try_create_stream(
+        &sender, &recipient, &deposit, &(i128::MAX / 2), &0u64, &0u64, &3u64,
+    );
+
+    assert_eq!(result, Err(Ok(ContractError::InvalidParams)));
+    assert_eq!(client.get_stream_count(), count_before, "counter must not advance");
+    assert_eq!(token.balance(&sender), balance_before, "no tokens must move");
+    assert_eq!(token.balance(&contract_id), 0, "contract balance must stay 0");
+}
+
+/// deposit < rate * duration → InsufficientDeposit, no side effects.
+#[test]
+fn i128_boundary_insufficient_deposit_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    let rate: i128 = i128::MAX / 1_000_000;
+    let duration: u64 = 1_000_000;
+    let required = rate * duration as i128;
+    let deposit = required - 1;
+
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &deposit);
+    let token = TokenClient::new(&env, &token_id);
+
+    env.ledger().set_timestamp(0);
+    let result = client.try_create_stream(
+        &sender, &recipient, &deposit, &rate, &0u64, &0u64, &duration,
+    );
+
+    assert_eq!(result, Err(Ok(ContractError::InsufficientDeposit)));
+    assert_eq!(token.balance(&sender), deposit, "sender balance unchanged");
+    assert_eq!(token.balance(&contract_id), 0, "contract balance unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// 6. Batch creation overflow atomicity
+// ---------------------------------------------------------------------------
+
+/// Batch where total deposit overflows i128 → InvalidParams, atomic rollback.
+#[test]
+fn i128_boundary_batch_total_overflow_atomic() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.init(&token_id, &admin);
+
+    // Each entry: deposit = i128::MAX/2 + 1; two entries overflow the sum
+    let per_deposit: i128 = i128::MAX / 2 + 1;
+    StellarAssetClient::new(&env, &token_id).mint(&sender, &per_deposit);
+    let token = TokenClient::new(&env, &token_id);
+
+    env.ledger().set_timestamp(0);
+    let count_before = client.get_stream_count();
+    let balance_before = token.balance(&sender);
+
+    let mut params = soroban_sdk::Vec::new(&env);
+    for _ in 0..2 {
+        params.push_back(CreateStreamParams {
+            recipient: Address::generate(&env),
+            deposit_amount: per_deposit,
+            rate_per_second: per_deposit,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 1,
+        });
+    }
+
+    let result = client.try_create_streams(&sender, &params);
+    assert!(result.is_err(), "overflow batch must fail");
+    assert_eq!(client.get_stream_count(), count_before, "counter must not advance");
+    assert_eq!(token.balance(&sender), balance_before, "no tokens must move");
 }

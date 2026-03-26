@@ -427,3 +427,109 @@ errors relevant to stream creation and timing.
 ## Error Reference
 
 For a full list of contract errors, see [error.md](./error.md).
+
+---
+
+## i128 Boundary Streams: Near-Max Rate/Deposit Semantics
+
+This section documents the protocol's observable guarantees when `deposit_amount` or
+`rate_per_second` approach the `i128` type boundary. It is the authoritative reference
+for integrators, auditors, and treasury operators working with large-value streams.
+
+### Numeric Limits
+
+| Parameter        | Minimum | Maximum (technical) | Binding constraint on mainnet |
+|------------------|---------|---------------------|-------------------------------|
+| `deposit_amount` | 1       | `i128::MAX`         | Token's total supply          |
+| `rate_per_second`| 1       | `i128::MAX`         | `deposit >= rate * duration`  |
+| `duration` (s)   | 1       | `u64::MAX`          | `rate * duration` must fit `i128` |
+
+No arbitrary protocol-level caps are enforced beyond the type system and the
+`deposit >= rate * duration` invariant. Application-layer limits belong in factory
+contracts or frontend validation.
+
+### Creation: Success Semantics
+
+A stream is accepted when all of the following hold:
+
+1. `deposit_amount > 0` and `rate_per_second > 0`
+2. `sender != recipient`
+3. `start_time < end_time` and `start_time >= ledger.timestamp()`
+4. `cliff_time` in `[start_time, end_time]`
+5. `deposit_amount >= rate_per_second * (end_time - start_time)` — checked with `checked_mul`
+6. Token transfer from sender succeeds
+
+On success: stream is persisted with `status = Active`, `withdrawn_amount = 0`,
+`cancelled_at = None`, and a `StreamCreated` event is emitted with all fields
+(including `deposit_amount` and `rate_per_second`) matching the supplied values exactly.
+
+### Creation: Failure Semantics
+
+| Condition | Error | Side effects |
+|-----------|-------|--------------|
+| `rate * duration` overflows `i128` | `InvalidParams` | None — no stream, no token movement, no event |
+| `deposit < rate * duration` | `InsufficientDeposit` | None |
+| Any other validation failure | `InvalidParams` or `StartTimeInPast` | None |
+
+All failures are atomic: the stream counter does not advance, no tokens move, and no
+`StreamCreated` event is emitted.
+
+### Accrual: Observable Guarantees at Near-Max Scale
+
+The accrual formula is:
+
+```
+if current_time < cliff_time           → 0
+if start_time >= end_time or rate < 0  → 0
+
+elapsed_now    = min(current_time, end_time)
+elapsed_secs   = elapsed_now - start_time   (0 if underflow)
+accrued        = elapsed_secs * rate        (overflow → deposit_amount)
+result         = clamp(accrued, 0, deposit_amount)
+```
+
+Guaranteed properties (verified by automated tests):
+
+1. **Zero at start**: `accrued(start_time) == 0`
+2. **Zero before cliff**: `accrued(t) == 0` for all `t < cliff_time`
+3. **Cliff uses start_time**: at `t = cliff_time`, elapsed is measured from `start_time`, not `cliff_time`
+4. **Saturation at end**: `accrued(t) == min(rate * duration, deposit)` for all `t >= end_time`
+5. **Monotonicity**: `accrued(t1) <= accrued(t2)` for all `t1 <= t2`
+6. **Boundedness**: `0 <= accrued(t) <= deposit_amount` for all `t`, including `u64::MAX`
+7. **Overflow safety**: if `elapsed * rate` overflows `i128`, the result is `deposit_amount` (not a panic)
+8. **Determinism**: same inputs always produce the same output
+
+### Withdrawal at Near-Max Scale
+
+- `withdrawn_amount` is incremented by the exact amount transferred; no rounding.
+- When `withdrawn_amount == deposit_amount`, status transitions to `Completed`.
+- The `Withdrawal` event payload carries the exact `amount` transferred.
+- Token balance invariant: `contract_balance_after == contract_balance_before - amount`.
+
+### Cancellation at Near-Max Scale
+
+After a successful cancellation at time `T`:
+
+- `cancelled_at = Some(T)`
+- `frozen_accrued = calculate_accrued_amount(..., T)`
+- `refund = deposit_amount - frozen_accrued`
+- Invariant: `refund + frozen_accrued == deposit_amount` (no rounding loss)
+- Accrual is frozen: `calculate_accrued` returns `frozen_accrued` for all future timestamps
+- Recipient may withdraw `frozen_accrued - withdrawn_amount`; status remains `Cancelled`
+
+### Residual Risks and Audit Notes
+
+1. **Token supply cap**: The contract accepts any `deposit_amount` up to `i128::MAX`.
+   On mainnet, the token's own supply is the binding constraint. Integrators must
+   verify the token's `total_supply` before creating near-max streams.
+
+2. **Gas budget**: Soroban instruction budgets are not enforced in the test harness.
+   Near-max streams are mathematically valid but callers should verify on-chain budget
+   headroom, especially for batch operations.
+
+3. **Token trust model**: The contract assumes a well-behaved SEP-41 token. A malicious
+   token could re-enter between state update and transfer; CEI ordering reduces but does
+   not eliminate this risk (see `docs/security.md`).
+
+4. **Batch deposit sum**: `create_streams` accumulates deposits with `checked_add`.
+   A batch whose total exceeds `i128::MAX` is rejected with `InvalidParams` atomically.
