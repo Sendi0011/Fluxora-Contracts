@@ -6,6 +6,7 @@ as the canonical source of truth for indexers and backend parsers. The schemas
 below are derived directly from the contract source `contracts/stream/src/lib.rs`.
 
 Notes:
+
 - Soroban events contain an ordered list of topics and a single `data` payload.
 - Topics shown below are the literal values used in `env.events().publish(...)`.
 - Types use the contract's Rust types (e.g. `u64`, `i128`, `Address`).
@@ -28,6 +29,7 @@ Notes:
 | StreamEndExtended | `["end_ext", stream_id: u64]`  | `StreamEndExtended { stream_id: u64, old_end_time: u64, new_end_time: u64 }`                                                                              | When `extend_stream_end_time` successfully extends a stream.                                                             |
 | StreamToppedUp   | `["top_up", stream_id: u64]`    | `StreamToppedUp { stream_id: u64, top_up_amount: i128, new_deposit_amount: i128 }`                                                                        | When `top_up_stream` successfully increases a stream's deposit.                                                          |
 | AdminUpdated     | `["AdminUpdated"]`              | `(old_admin: Address, new_admin: Address)`                                                                                                                | When the contract admin is rotated via `set_admin`.                                                                     |
+| ContractPaused   | `["paused_ctl"]`                | `bool`                                                                                                                                                    | When the global contract pause state is toggled via `set_contract_paused`.                                              |
 
 ---
 | Event name | Topic(s) | Data (shape & types) | When emitted |
@@ -38,6 +40,7 @@ Notes:
 | StreamResumed | ["resumed", stream_id] | StreamEvent::Resumed(stream_id) — enum wrapper containing the u64 stream id | When a paused stream is resumed by the sender or admin.
 | StreamCancelled | ["cancelled", stream_id] | StreamEvent::StreamCancelled(stream_id) — enum wrapper containing the u64 stream id | When a stream is cancelled by the sender or admin.
 | AdminUpdated | ["admin", "updated"] | (old_admin: Address, new_admin: Address) | When contract admin is rotated via `set_admin`.
+| ContractPaused | ["paused_ctl"] | bool | When global pause is set to true or false.
 
 ## Exact Soroban event structure
 
@@ -135,13 +138,13 @@ pub enum StreamEvent {
 }
 ```
 
-| Function(s)                                  | Topic          | Data enum variant              |
-|----------------------------------------------|----------------|--------------------------------|
-| `pause_stream`, `pause_stream_as_admin`      | `"paused"`     | `StreamEvent::Paused(id)`      |
-| `resume_stream`, `resume_stream_as_admin`    | `"resumed"`    | `StreamEvent::Resumed(id)`     |
-| `cancel_stream`, `cancel_stream_as_admin`    | `"cancelled"`  | `StreamEvent::StreamCancelled(id)` |
-| `withdraw`, `batch_withdraw` (final drain on Active streams) | `"completed"`  | `StreamEvent::StreamCompleted(id)` |
-| `close_completed_stream`                     | `"closed"`     | `StreamEvent::StreamClosed(id)` |
+| Function(s)                                                  | Topic         | Data enum variant                  |
+| ------------------------------------------------------------ | ------------- | ---------------------------------- |
+| `pause_stream`, `pause_stream_as_admin`                      | `"paused"`    | `StreamEvent::Paused(id)`          |
+| `resume_stream`, `resume_stream_as_admin`                    | `"resumed"`   | `StreamEvent::Resumed(id)`         |
+| `cancel_stream`, `cancel_stream_as_admin`                    | `"cancelled"` | `StreamEvent::StreamCancelled(id)` |
+| `withdraw`, `batch_withdraw` (final drain on Active streams) | `"completed"` | `StreamEvent::StreamCompleted(id)` |
+| `close_completed_stream`                                     | `"closed"`    | `StreamEvent::StreamClosed(id)`    |
 
 Example (cancelled):
 
@@ -264,8 +267,9 @@ If you change event topics or payloads in the contract, please update this
 document to match and include example snapshots.
 
 ---
+
 Commit message suggestion: `docs: add event schema and topics for indexers`
-| Source location                                              | Symbol emitted  |
+| Source location | Symbol emitted |
 |--------------------------------------------------------------|-----------------|
 | `persist_new_stream`                                         | `"created"`     |
 | `withdraw`, `batch_withdraw`                                 | `"withdrew"`    |
@@ -280,6 +284,7 @@ Commit message suggestion: `docs: add event schema and topics for indexers`
 | `extend_stream_end_time`                                     | `"end_ext"`     |
 | `top_up_stream`                                              | `"top_up"`      |
 | `set_admin`                                                  | `"AdminUpdated"`|
+| `set_contract_paused`                                        | `"paused_ctl"`  |
 
 If you change event topics or payloads in the contract, update this document and
 include updated example snapshots in the PR.

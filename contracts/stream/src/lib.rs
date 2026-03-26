@@ -3,8 +3,7 @@
 mod accrual;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
-    Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -1449,7 +1448,7 @@ impl FluxoraStream {
 
         // Emit event with old and new admin addresses
         env.events()
-            .publish((Symbol::new(&env, "AdminUpdated"),), (old_admin, new_admin));
+            .publish((symbol_short!("AdminUpd"),), (old_admin, new_admin));
         
         Ok(())
     }
@@ -1628,7 +1627,10 @@ impl FluxoraStream {
         let now = env.ledger().timestamp();
 
         // New end time must be in the future relative to the current ledger timestamp.
-        if new_end_time < now || new_end_time <= stream.start_time || new_end_time < stream.cliff_time {
+        if new_end_time < now
+            || new_end_time <= stream.start_time
+            || new_end_time < stream.cliff_time
+        {
             return Err(ContractError::InvalidParams);
         }
 
@@ -1712,7 +1714,11 @@ impl FluxoraStream {
         let now = env.ledger().timestamp();
 
         // Must move end_time forward in time.
-        if new_end_time <= stream.end_time || new_end_time <= stream.start_time || new_end_time < stream.cliff_time || new_end_time < now {
+        if new_end_time <= stream.end_time
+            || new_end_time <= stream.start_time
+            || new_end_time < stream.cliff_time
+            || new_end_time < now
+        {
             return Err(ContractError::InvalidParams);
         }
 
