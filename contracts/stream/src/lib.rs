@@ -270,14 +270,6 @@ fn set_stream_count(env: &Env, count: u64) {
     bump_instance_ttl(env);
 }
 
-fn read_global_paused(env: &Env) -> bool {
-    bump_instance_ttl(env);
-    env.storage()
-        .instance()
-        .get(&DataKey::GlobalPaused)
-        .unwrap_or(false)
-}
-
 fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, ContractError> {
     let key = DataKey::Stream(stream_id);
     let stream: Stream = env
@@ -299,9 +291,11 @@ fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, ContractError> {
 pub fn save_stream(env: &Env, stream: &Stream) {
     let key = DataKey::Stream(stream.stream_id);
     env.storage().persistent().set(&key, stream);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 fn is_terminal_state(env: &Env, stream: &Stream) -> bool {
@@ -663,7 +657,7 @@ impl FluxoraStream {
         end_time: u64,
     ) -> Result<u64, ContractError> {
         sender.require_auth();
-        if read_global_paused(&env) {
+        if is_global_emergency_paused(&env) {
             return Err(ContractError::ContractPaused);
         }
 
@@ -736,7 +730,7 @@ impl FluxoraStream {
         streams: soroban_sdk::Vec<CreateStreamParams>,
     ) -> Result<soroban_sdk::Vec<u64>, ContractError> {
         sender.require_auth();
-        if read_global_paused(&env) {
+        if is_global_emergency_paused(&env) {
             return Err(ContractError::ContractPaused);
         }
 
@@ -1038,7 +1032,8 @@ impl FluxoraStream {
         // CEI: update state before external token transfer to reduce reentrancy risk.
         // Assumption: the token contract does not reenter this contract.
         stream.withdrawn_amount += withdrawable;
-        let completed_now = (stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused)
+        let completed_now = (stream.status == StreamStatus::Active
+            || stream.status == StreamStatus::Paused)
             && stream.withdrawn_amount == stream.deposit_amount;
         if completed_now {
             stream.status = StreamStatus::Completed;
@@ -1152,7 +1147,8 @@ impl FluxoraStream {
         }
 
         stream.withdrawn_amount += withdrawable;
-        let completed_now = (stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused)
+        let completed_now = (stream.status == StreamStatus::Active
+            || stream.status == StreamStatus::Paused)
             && stream.withdrawn_amount == stream.deposit_amount;
         if completed_now {
             stream.status = StreamStatus::Completed;
@@ -1254,7 +1250,8 @@ impl FluxoraStream {
 
             if withdrawable > 0 {
                 stream.withdrawn_amount += withdrawable;
-                let completed_now = (stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused)
+                let completed_now = (stream.status == StreamStatus::Active
+                    || stream.status == StreamStatus::Paused)
                     && stream.withdrawn_amount == stream.deposit_amount;
                 if completed_now {
                     stream.status = StreamStatus::Completed;
@@ -1526,16 +1523,6 @@ impl FluxoraStream {
         env.events()
             .publish((symbol_short!("AdminUpd"),), (old_admin, new_admin));
 
-        Ok(())
-    }
-
-    /// Set global pause; create_stream/create_streams panic_with_error(ContractPaused) while true.
-    pub fn set_contract_paused(env: Env, paused: bool) -> Result<(), ContractError> {
-        get_admin(&env)?.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::GlobalPaused, &paused);
-        bump_instance_ttl(&env);
         Ok(())
     }
 
@@ -2138,8 +2125,7 @@ impl FluxoraStream {
     /// - Accrued funds stay in the contract until the recipient calls `withdraw()`.
     /// - No auto-transfer of accrued funds to the recipient occurs on admin cancel.
     pub fn cancel_stream_as_admin(env: Env, stream_id: u64) -> Result<(), ContractError> {
-        let admin = get_admin(&env)?;
-        admin.require_auth();
+        get_admin(&env)?.require_auth();
 
         let mut stream = load_stream(&env, stream_id)?;
 
@@ -2171,8 +2157,7 @@ impl FluxoraStream {
     /// - Accrual continues based on time (pause doesn't stop time)
     /// - Recipient cannot withdraw while paused
     pub fn pause_stream_as_admin(env: Env, stream_id: u64) -> Result<(), ContractError> {
-        let admin = get_admin(&env)?;
-        admin.require_auth();
+        get_admin(&env)?.require_auth();
 
         let mut stream = load_stream(&env, stream_id)?;
 
@@ -2255,9 +2240,8 @@ impl FluxoraStream {
     ///
     /// # Events
     /// - Publishes topic `gl_pause` with [`GlobalEmergencyPauseChanged`] data.
-    pub fn set_global_emergency_paused(env: Env, paused: bool) {
-        let admin = get_admin(&env);
-        admin.require_auth();
+    pub fn set_global_emergency_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+        get_admin(&env)?.require_auth();
 
         env.storage()
             .instance()
@@ -2268,6 +2252,7 @@ impl FluxoraStream {
             (symbol_short!("gl_pause"),),
             GlobalEmergencyPauseChanged { paused },
         );
+        Ok(())
     }
 }
 
