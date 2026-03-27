@@ -2839,3 +2839,72 @@ fn integration_create_streams_single_token_pull_equals_sum() {
     assert_eq!(ctx.token.balance(&ctx.sender), sender_before - 3500);
     assert_eq!(ctx.token.balance(&ctx.contract_id), 3500);
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests — Issue #315: top-up near-complete streams
+// ---------------------------------------------------------------------------
+
+/// Top-up a near-complete stream, then immediately withdraw: the recipient
+/// receives the full accrued amount including the topped-up deposit.
+#[test]
+fn integration_top_up_near_complete_then_immediate_claim() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Stream: 1000 tokens, rate 1/s, 0..1000s
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Advance to T-1 (999s) and top up 500 tokens
+    ctx.env.ledger().set_timestamp(999);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &500_i128);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, 1_500);
+
+    // Recipient withdraws immediately: accrued = min(999, 1000) * 1 = 999
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 999);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 999);
+
+    // Contract still holds 501 (the 1 token accruing at t=1000 + 500 top-up)
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 501);
+
+    // At end_time, recipient can claim the remaining 1 token (the 500 extra
+    // remains locked until end_time is extended or the stream is cancelled)
+    ctx.env.ledger().set_timestamp(1000);
+    let final_withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(final_withdrawn, 1); // only 1 more second accrued (999→1000)
+    assert_eq!(ctx.token.balance(&ctx.recipient), 1000);
+}
+
+/// Top-up at exactly end_time must be rejected (no seconds left to stream).
+#[test]
+fn integration_top_up_at_end_time_rejected() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(1000);
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &500_i128);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}

@@ -4002,6 +4002,81 @@ fn test_top_up_stream_preserves_invariants_for_large_streams() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — Issue #315: top-up near-complete streams
+// ---------------------------------------------------------------------------
+
+/// Top-up at T-1 (one second before end) must succeed and increase deposit.
+#[test]
+fn test_top_up_at_t_minus_1_succeeds() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // end_time = 1000
+
+    ctx.env.ledger().set_timestamp(999); // T - 1
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &500_i128);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, 1_500);
+    assert_eq!(state.end_time, 1_000); // schedule unchanged
+}
+
+/// Top-up exactly at T (current_time == end_time) must fail with InvalidState.
+#[test]
+fn test_top_up_at_end_time_fails() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // end_time = 1000
+
+    ctx.env.ledger().set_timestamp(1000); // exactly at T
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &500_i128);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
+
+/// Top-up with zero amount must fail with InvalidParams.
+#[test]
+fn test_top_up_zero_amount_fails() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(100);
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &0_i128);
+    assert_eq!(result, Err(Ok(ContractError::InvalidParams)));
+}
+
+/// A third-party address (neither sender nor admin) must be rejected.
+#[test]
+fn test_top_up_unauthorized_funder_fails() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let stranger = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(100);
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &stranger, &500_i128);
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+}
+
+/// Admin is allowed to top up any stream.
+#[test]
+fn test_top_up_by_admin_succeeds() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(100);
+    // Mint tokens to admin so the pull can succeed
+    ctx.sac.mint(&ctx.admin, &1_000_i128);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.admin, &500_i128);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, 1_500);
+}
+
+// ---------------------------------------------------------------------------
 // Tests — Issue #37: withdraw reject when stream is Paused
 // ---------------------------------------------------------------------------
 

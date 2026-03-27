@@ -146,8 +146,11 @@ pub struct StreamEndExtended {
 #[derive(Clone, Debug)]
 pub struct StreamToppedUp {
     pub stream_id: u64,
-    pub top_up_amount: i128,
-    pub new_deposit_amount: i128,
+    pub added_amount: i128,
+    pub new_total: i128,
+    /// `end_time` after the top-up (unchanged by top-up itself; included so
+    /// indexers can correlate with any subsequent `extend_stream_end_time` call).
+    pub new_end_time: u64,
 }
 
 #[contracttype]
@@ -1756,15 +1759,21 @@ impl FluxoraStream {
     ///
     /// # Parameters
     /// - `stream_id`: Unique identifier of the stream to top up.
-    /// - `funder`: Address providing the additional tokens. This may be the original
-    ///   sender, the contract admin, or any other authorized treasury address.
+    /// - `funder`: Address providing the additional tokens. Must be the original
+    ///   stream sender or the contract admin.
     /// - `amount`: Additional amount of tokens to lock into the stream (must be > 0).
     ///
     /// # Authorization
     /// - Requires authorization from `funder`.
-    /// - No special relationship between `funder` and the original `sender` is enforced
-    ///   by the contract; protocol operators should constrain who can call this entrypoint
-    ///   at the application layer (e.g. only treasury multisig).
+    /// - `funder` must be either the stream's original `sender` or the contract admin.
+    ///   Any other address is rejected with `ContractError::Unauthorized`.
+    ///
+    /// # Near-Complete Handling
+    /// A top-up is rejected if `current_ledger_time >= end_time`. At that point the
+    /// stream is technically expired: all tokens have accrued and no new seconds remain
+    /// to stream the additional funds. Accepting a top-up here would lock tokens with
+    /// no mechanism to release them ("zombie" stream). The caller should instead cancel
+    /// the stream (if still Active/Paused) or create a new one.
     ///
     /// # Behaviour
     /// - Pulls `amount` tokens from `funder` into the contract.
@@ -1776,6 +1785,10 @@ impl FluxoraStream {
     /// # Restrictions
     /// - Only streams in `Active` or `Paused` status can be topped up.
     /// - `amount` must be strictly positive.
+    /// - `current_ledger_time` must be strictly less than `end_time`.
+    ///
+    /// # CEI Pattern
+    /// State is persisted **before** the external token pull to prevent reentrancy.
     ///
     /// # Events
     /// - Emits a `top_up` event with `StreamToppedUp` payload on success.
@@ -1785,37 +1798,56 @@ impl FluxoraStream {
         funder: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
-        funder.require_auth();
-
+        // --- Checks ---
         if amount <= 0 {
             return Err(ContractError::InvalidParams);
         }
 
-        let mut stream = load_stream(&env, stream_id)?;
+        let stream = load_stream(&env, stream_id)?;
 
         if stream.status != StreamStatus::Active && stream.status != StreamStatus::Paused {
             return Err(ContractError::InvalidState);
         }
 
-        // CEI: update and persist state BEFORE the external token transfer to reduce
-        // reentrancy risk. This mirrors the pattern used in cancel_stream and withdraw.
+        // Reject top-ups on expired streams to prevent zombie fund lock-up.
+        // Even if submitted in the same block as expiry, no seconds remain to
+        // stream the new funds, so the deposit would be permanently unclaimable.
+        let now = env.ledger().timestamp();
+        if now >= stream.end_time {
+            return Err(ContractError::InvalidState);
+        }
+
+        // Only the original sender or the contract admin may top up.
+        let config = get_config(&env)?;
+        if funder != stream.sender && funder != config.admin {
+            return Err(ContractError::Unauthorized);
+        }
+        funder.require_auth();
+
+        // --- Effects ---
         // Increase deposit_amount with overflow protection.
-        stream.deposit_amount = stream
+        let new_deposit = stream
             .deposit_amount
             .checked_add(amount)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .ok_or(ContractError::InvalidParams)?;
 
+        let new_end_time = stream.end_time;
+
+        // Persist updated state BEFORE the external token pull (CEI).
+        let mut stream = stream;
+        stream.deposit_amount = new_deposit;
         save_stream(&env, &stream);
 
-        // External token pull happens AFTER state is persisted (CEI-compliant).
+        // --- Interactions ---
         pull_token(&env, &funder, amount)?;
 
         env.events().publish(
             (symbol_short!("top_up"), stream_id),
             StreamToppedUp {
                 stream_id,
-                top_up_amount: amount,
-                new_deposit_amount: stream.deposit_amount,
+                added_amount: amount,
+                new_total: new_deposit,
+                new_end_time,
             },
         );
         Ok(())
