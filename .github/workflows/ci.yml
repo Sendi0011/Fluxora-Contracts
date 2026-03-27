@@ -106,6 +106,48 @@ jobs:
             sha256sum target/wasm32-unknown-unknown/release/fluxora_stream.optimized.wasm > target/wasm32-unknown-unknown/release/fluxora_stream.optimized.wasm.sha256
           fi
 
+      - name: Verify WASM build reproducibility
+        run: |
+          set -euo pipefail
+          REFERENCE_FILE="wasm/checksums.sha256"
+          WASM_FILE="target/wasm32-unknown-unknown/release/fluxora_stream.wasm"
+
+          if [ ! -f "${REFERENCE_FILE}" ]; then
+            echo "::error::Reference checksums file not found at ${REFERENCE_FILE}. Run script/update-wasm-checksums.sh to generate it."
+            exit 1
+          fi
+
+          if [ ! -f "${WASM_FILE}" ]; then
+            echo "::error::WASM artifact not found at ${WASM_FILE}. Build step may have failed."
+            exit 1
+          fi
+
+          # Extract the expected checksum from the reference file (skip comments and blank lines)
+          EXPECTED=$(grep -v '^#' "${REFERENCE_FILE}" | grep -v '^$' | grep 'fluxora_stream.wasm' | awk '{print $1}')
+          if [ -z "${EXPECTED}" ]; then
+            echo "::error::No reference checksum found for fluxora_stream.wasm in ${REFERENCE_FILE}"
+            exit 1
+          fi
+
+          # Compute the actual checksum of the built WASM
+          ACTUAL=$(sha256sum "${WASM_FILE}" | awk '{print $1}')
+
+          echo "Expected SHA256: ${EXPECTED}"
+          echo "Actual   SHA256: ${ACTUAL}"
+
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::WASM checksum mismatch! Build is not reproducible."
+            echo "  Expected: ${EXPECTED}"
+            echo "  Actual:   ${ACTUAL}"
+            echo ""
+            echo "This means the WASM output differs from the committed reference."
+            echo "If this is an intentional source change, run: bash script/update-wasm-checksums.sh"
+            echo "Then commit the updated wasm/checksums.sha256 file."
+            exit 1
+          fi
+
+          echo "WASM build reproducibility verified: checksum matches reference."
+
       - name: Upload WASM hash artifact
         uses: actions/upload-artifact@v4
         with:

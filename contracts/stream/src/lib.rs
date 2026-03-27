@@ -1,6 +1,8 @@
 #![no_std]
 
 mod accrual;
+#[cfg(test)]
+mod checksum;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
@@ -353,6 +355,17 @@ fn remove_stream_from_recipient_index(env: &Env, recipient: &Address, stream_id:
 /// Centralizes all token transfers INTO the contract for security review.
 /// Used when creating streams to pull deposit from sender.
 ///
+/// # Token Trust Model
+///
+/// This function assumes the token contract is a well-behaved SEP-41 / SAC token that:
+/// - Does not re-enter the streaming contract during `transfer`
+/// - Does not silently fail (panics or returns an error on insufficient balance)
+/// - Implements the standard Soroban token interface
+///
+/// If a malicious token violates these assumptions, the CEI pattern reduces but does not
+/// eliminate reentrancy impact — state will already reflect the current operation when
+/// the re-entry occurs.
+///
 /// # Parameters
 /// - `env`: Contract environment
 /// - `from`: Address to transfer tokens from (must have approved contract)
@@ -360,6 +373,14 @@ fn remove_stream_from_recipient_index(env: &Env, recipient: &Address, stream_id:
 ///
 /// # Panics
 /// - If token transfer fails (insufficient balance or allowance)
+/// - If token contract panics or returns an error
+///
+/// # Security Notes
+/// - CEI ordering: State is persisted BEFORE calling this function to reduce reentrancy risk
+/// - Atomic transaction: If this function panics, the entire transaction reverts
+/// - No silent failures: Token transfer either succeeds or fails explicitly
+///
+/// See [`token-assumptions.md`](../../docs/token-assumptions.md) for complete token trust model.
 fn pull_token(env: &Env, from: &Address, amount: i128) -> Result<(), ContractError> {
     let token_address = get_token(env)?;
     let token_client = token::Client::new(env, &token_address);
@@ -372,6 +393,17 @@ fn pull_token(env: &Env, from: &Address, amount: i128) -> Result<(), ContractErr
 /// Centralizes all token transfers OUT OF the contract for security review.
 /// Used for withdrawals (to recipient) and refunds (to sender on cancel).
 ///
+/// # Token Trust Model
+///
+/// This function assumes the token contract is a well-behaved SEP-41 / SAC token that:
+/// - Does not re-enter the streaming contract during `transfer`
+/// - Does not silently fail (panics or returns an error on insufficient balance)
+/// - Implements the standard Soroban token interface
+///
+/// If a malicious token violates these assumptions, the CEI pattern reduces but does not
+/// eliminate reentrancy impact — state will already reflect the current operation when
+/// the re-entry occurs.
+///
 /// # Parameters
 /// - `env`: Contract environment
 /// - `to`: Address to transfer tokens to
@@ -379,6 +411,14 @@ fn pull_token(env: &Env, from: &Address, amount: i128) -> Result<(), ContractErr
 ///
 /// # Panics
 /// - If token transfer fails (insufficient contract balance, should not happen)
+/// - If token contract panics or returns an error
+///
+/// # Security Notes
+/// - CEI ordering: State is persisted BEFORE calling this function to reduce reentrancy risk
+/// - Atomic transaction: If this function panics, the entire transaction reverts
+/// - No silent failures: Token transfer either succeeds or fails explicitly
+///
+/// See [`token-assumptions.md`](../../docs/token-assumptions.md) for complete token trust model.
 fn push_token(env: &Env, to: &Address, amount: i128) -> Result<(), ContractError> {
     let token_address = get_token(env)?;
     let token_client = token::Client::new(env, &token_address);
@@ -521,6 +561,20 @@ impl FluxoraStream {
     /// - Bootstrap authorization is explicit: only a signer controlling `admin` can initialize
     /// - Re-initialization is prevented to ensure immutable token and admin configuration
     /// - Failed re-initialization attempts are side-effect free (config/counter unchanged)
+    ///
+    /// # Token Trust Model
+    ///
+    /// The `token` address is stored immutably after initialization. All subsequent token
+    /// operations (transfers) will use this address. The contract assumes the token at this
+    /// address is a well-behaved SEP-41 / SAC token that:
+    /// - Does not re-enter the streaming contract during transfers
+    /// - Does not silently fail (panics or returns an error on insufficient balance)
+    /// - Implements the standard Soroban token interface
+    ///
+    /// **Operators are responsible for verifying token behavior before initialization.**
+    /// If a malicious token is used, the contract's behavior may become unpredictable.
+    ///
+    /// See [`token-assumptions.md`](../../docs/token-assumptions.md) for complete token trust model.
     pub fn init(env: Env, token: Address, admin: Address) -> Result<(), ContractError> {
         admin.require_auth();
         if env.storage().instance().has(&DataKey::Config) {
