@@ -10570,7 +10570,8 @@ fn test_global_pause_does_not_affect_existing_streams() {
     assert_eq!(state.withdrawn_amount, 100);
 
     // 2. Top-up should work
-    ctx.client().top_up_stream(&stream_id, &ctx.sender, &100_i128);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &100_i128);
     let state_after_topup = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_after_topup.deposit_amount, 1100);
 
@@ -10584,7 +10585,6 @@ fn test_global_pause_does_not_affect_existing_streams() {
     let state_after_cancel = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_after_cancel.status, StreamStatus::Cancelled);
 }
-
 
 /// create_streams (batch) must reject when any stream's start_time is in the past,
 /// emitting StartTimeInPast as a structured error so integrators can handle it.

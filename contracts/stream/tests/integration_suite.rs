@@ -2929,7 +2929,8 @@ fn integration_global_pause_lifecycle() {
     assert_eq!(result_batch, Err(Ok(ContractError::ContractPaused)));
 
     // 5. Active stream operations continue: Top-up succeeds
-    ctx.client().top_up_stream(&stream_id, &ctx.sender, &500_i128);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &500_i128);
 
     // 6. Active stream operations continue: Withdraw succeeds
     ctx.env.ledger().set_timestamp(500);
