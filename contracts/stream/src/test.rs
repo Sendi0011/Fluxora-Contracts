@@ -8180,6 +8180,144 @@ fn test_create_streams_batch_empty() {
 }
 
 #[test]
+fn test_create_streams_batch_empty_requires_auth() {
+    // Empty batch still requires sender authorization
+    let ctx = TestContext::setup_strict();
+    let streams = Vec::new(&ctx.env);
+
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    // Mock sender auth for empty batch
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_streams",
+            args: (&ctx.sender, streams.clone()).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    assert_eq!(ids.len(), 0);
+}
+
+#[test]
+fn test_create_streams_batch_empty_no_events() {
+    // Empty batch must not emit any events
+    let ctx = TestContext::setup();
+    let streams = Vec::new(&ctx.env);
+
+    let events_before = ctx.env.events().all().len();
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    let events_after = ctx.env.events().all().len();
+
+    assert_eq!(ids.len(), 0);
+    assert_eq!(
+        events_before, events_after,
+        "empty batch must not emit any events"
+    );
+}
+
+#[test]
+fn test_create_streams_batch_empty_no_state_change() {
+    // Empty batch must not change stream count or any state
+    let ctx = TestContext::setup();
+    let streams = Vec::new(&ctx.env);
+
+    let count_before = ctx.client().get_stream_count();
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    let count_after = ctx.client().get_stream_count();
+
+    assert_eq!(ids.len(), 0);
+    assert_eq!(
+        count_before, count_after,
+        "empty batch must not advance stream ID counter"
+    );
+}
+
+#[test]
+fn test_create_streams_batch_empty_then_normal_create() {
+    // After empty batch, next stream should get ID 0 (not skipped)
+    let ctx = TestContext::setup();
+
+    // First: empty batch
+    let empty_streams = Vec::new(&ctx.env);
+    let empty_ids = ctx.client().create_streams(&ctx.sender, &empty_streams);
+    assert_eq!(empty_ids.len(), 0);
+
+    // Second: normal create_stream
+    let id1 = ctx.create_default_stream();
+    assert_eq!(id1, 0, "first stream after empty batch should get ID 0");
+
+    // Third: another empty batch
+    let empty_ids2 = ctx.client().create_streams(&ctx.sender, &empty_streams);
+    assert_eq!(empty_ids2.len(), 0);
+
+    // Fourth: another normal create_stream
+    let id2 = ctx.create_default_stream();
+    assert_eq!(id2, 1, "second stream should get ID 1");
+}
+
+#[test]
+fn test_create_streams_batch_empty_multiple_times() {
+    // Multiple empty batches should all succeed and have no side effects
+    let ctx = TestContext::setup();
+    let streams = Vec::new(&ctx.env);
+
+    let initial_balance = ctx.token().balance(&ctx.sender);
+    let initial_count = ctx.client().get_stream_count();
+
+    for _ in 0..5 {
+        let ids = ctx.client().create_streams(&ctx.sender, &streams);
+        assert_eq!(ids.len(), 0);
+    }
+
+    assert_eq!(
+        ctx.token().balance(&ctx.sender),
+        initial_balance,
+        "balance must not change after multiple empty batches"
+    );
+    assert_eq!(
+        ctx.client().get_stream_count(),
+        initial_count,
+        "stream count must not change after multiple empty batches"
+    );
+}
+
+#[test]
+fn test_create_streams_batch_empty_when_paused() {
+    // Empty batch should succeed even when contract is paused
+    let ctx = TestContext::setup();
+    let streams = Vec::new(&ctx.env);
+
+    // Pause contract
+    ctx.client().set_contract_paused(&ctx.admin, &true);
+
+    // Empty batch should still succeed (no-op)
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    assert_eq!(ids.len(), 0);
+}
+
+#[test]
+fn test_create_streams_batch_empty_recipient_index_unchanged() {
+    // Empty batch must not affect recipient stream indices
+    let ctx = TestContext::setup();
+    let recipient = Address::generate(&ctx.env);
+    let streams = Vec::new(&ctx.env);
+
+    let count_before = ctx.client().get_recipient_stream_count(recipient.clone());
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    let count_after = ctx.client().get_recipient_stream_count(recipient.clone());
+
+    assert_eq!(ids.len(), 0);
+    assert_eq!(
+        count_before, count_after,
+        "empty batch must not modify recipient stream index"
+    );
+}
+
+#[test]
 fn test_create_streams_batch_strict_auth() {
     let ctx = TestContext::setup_strict();
 

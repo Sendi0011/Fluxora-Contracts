@@ -720,6 +720,84 @@ impl FluxoraStream {
     /// # Security Notes
     /// - Self-streaming is disallowed per entry: `sender` must not equal `recipient`
     /// - Validation is completed before any external token interaction
+    /// Create multiple payment streams in a single atomic batch operation.
+    ///
+    /// This function enables treasury operators and integrators to create multiple streams
+    /// with a single authorization and token transfer, reducing gas costs and ensuring
+    /// all-or-nothing semantics.
+    ///
+    /// # Parameters
+    /// - `sender`: Address that funds and authorizes the batch (must authorize this call)
+    /// - `streams`: Vector of `CreateStreamParams` defining each stream's schedule and recipient
+    ///
+    /// # Authorization
+    /// - Requires `sender.require_auth()` (single auth check for entire batch)
+    /// - Fails atomically if sender is not authorized
+    ///
+    /// # Empty Vector Semantics
+    /// When `streams` is empty:
+    /// - Returns `Ok(Vec::new())` (empty result vector)
+    /// - No tokens are transferred (total_deposit = 0)
+    /// - No streams are persisted
+    /// - No `StreamCreated` events are emitted
+    /// - Stream ID counter is not advanced
+    /// - Authorization is still required (sender must authorize the call)
+    /// - Contract state remains unchanged
+    /// - No errors are raised (empty batch is valid)
+    ///
+    /// # Success Semantics
+    /// When `streams` is non-empty:
+    /// 1. All entries are validated before any state changes (first pass)
+    /// 2. Total deposit is calculated with overflow protection
+    /// 3. Tokens are transferred atomically: `sum(deposit_amount)` from sender to contract
+    /// 4. Stream IDs are allocated sequentially (contiguous, starting from next available ID)
+    /// 5. Each stream is persisted with status `Active`
+    /// 6. Recipient stream index is updated (sorted by stream_id)
+    /// 7. One `StreamCreated` event is emitted per stream (in order)
+    /// 8. Returned vector contains stream IDs in the same order as input entries
+    ///
+    /// # Failure Semantics
+    /// If any validation fails (or total-deposit sum overflows):
+    /// - No streams are created
+    /// - No tokens are transferred
+    /// - No events are emitted
+    /// - Stream ID counter is not advanced
+    /// - Entire batch is reverted (atomic)
+    /// - Error is returned to caller
+    ///
+    /// Validation failures include:
+    /// - Any entry has invalid parameters (see `validate_stream_params`)
+    /// - Total deposit sum overflows `i128`
+    /// - Contract is globally paused
+    /// - Sender is not authorized
+    ///
+    /// # Invariants After Success
+    /// - `returned_ids.len() == streams.len()`
+    /// - `returned_ids[i]` is the ID of the stream created from `streams[i]`
+    /// - Each stream has status `Active` and `withdrawn_amount = 0`
+    /// - Each recipient's stream index includes the new stream_id (sorted)
+    /// - Total tokens transferred = `sum(deposit_amount)`
+    /// - Stream ID counter advanced by `streams.len()`
+    ///
+    /// # Gas Considerations
+    /// - Single token transfer (vs. N transfers for N individual `create_stream` calls)
+    /// - Batch validation reduces redundant checks
+    /// - Recipient index updates are O(n log n) total (binary search per stream)
+    ///
+    /// # Events
+    /// - On success: one `StreamCreated` event per stream
+    /// - On failure: no events
+    /// - On empty batch: no events
+    ///
+    /// # Example
+    /// ```ignore
+    /// let params = vec![
+    ///     CreateStreamParams { recipient: alice, deposit_amount: 1000, ... },
+    ///     CreateStreamParams { recipient: bob, deposit_amount: 2000, ... },
+    /// ];
+    /// let ids = contract.create_streams(&sender, &params)?;
+    /// // ids = [0, 1] (assuming first batch)
+    /// ```
     pub fn create_streams(
         env: Env,
         sender: Address,
@@ -754,6 +832,7 @@ impl FluxoraStream {
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas.
+        // Empty batch: total_deposit = 0, no transfer occurs.
         if total_deposit > 0 {
             pull_token(&env, &sender, total_deposit)?;
         }
@@ -1177,6 +1256,16 @@ impl FluxoraStream {
     ///   `amount` is 0 for streams that are already `Completed` or have nothing to withdraw
     ///   (before cliff, or accrued == withdrawn). No token transfer or event is emitted for
     ///   those entries.
+    ///
+    /// # Empty Vector Semantics
+    /// When `stream_ids` is empty:
+    /// - Returns `Ok(Vec::new())` (empty result vector)
+    /// - No streams are processed
+    /// - No tokens are transferred
+    /// - No events are emitted
+    /// - Authorization is still required: `recipient.require_auth()` is called and must succeed
+    /// - Contract state remains unchanged
+    /// - No errors are raised (empty batch is valid)
     ///
     /// # Completed streams
     /// A `Completed` stream in the batch does **not** panic. It contributes a zero-amount

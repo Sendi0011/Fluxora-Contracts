@@ -310,9 +310,11 @@ A `Paused` stream **does** panic and reverts the entire batch.
 
 Residual assumption: deployment flow must ensure the intended bootstrap admin signs the first init transaction.
 
-### create_streams: Batch Atomicity and Single Auth
+### create_streams: Batch Atomicity, Single Auth, and Empty Vector Semantics
 
 `create_streams(sender, streams)` is the batch creation entrypoint for treasury operators and indexers.
+
+#### Non-Empty Batch Semantics
 
 - Single auth: only `sender` must authorize, and it is checked once for the entire batch.
 - Batch validation: every entry is validated before token transfer or persistence.
@@ -321,18 +323,85 @@ Residual assumption: deployment flow must ensure the intended bootstrap admin si
 - Event behavior: on success, one `created` event is emitted per created stream; on failure, no `created` events are emitted.
 - Ordering guarantee: returned stream IDs are contiguous and in the same order as input entries.
 
-Scope note: these guarantees are limited to `create_streams` creation semantics. They do not change withdrawal, pause/resume, cancellation, or cleanup rules.
+#### Empty Vector Semantics
 
-### withdraw: Recipient-Only Auth and Completion Transition
+When `streams` is an empty vector:
 
-`withdraw(stream_id)` enforces recipient-only authorization and deterministic completion semantics:
+**Success Behavior (Observable):**
+- Returns `Ok(Vec::new())` (empty result vector)
+- No tokens are transferred (total_deposit = 0, no `pull_token` call)
+- No streams are persisted (stream count unchanged)
+- No `StreamCreated` events are emitted
+- Stream ID counter is not advanced
+- Contract state remains unchanged
+- Authorization is still required: `sender.require_auth()` is called and must succeed
+- No errors are raised (empty batch is valid and succeeds)
 
-- Auth boundary: only the stream `recipient` can authorize `withdraw`.
+**Failure Behavior (Observable):**
+- If `sender` is not authorized: authorization failure before any state changes
+- If contract is globally paused: `ContractError::ContractPaused` returned, no state changes
+- Any failure is atomic: no state mutation, no token transfer, no events
+
+**Invariants After Empty Batch:**
+- Returned vector has length 0
+- Stream count unchanged
+- Token balances unchanged
+- No new events in event log
+- Recipient stream indices unchanged
+- Multiple empty batches have identical observable effects (idempotent)
+
+**Rationale:**
+- Empty batch is a valid no-op: allows callers to submit conditional batches without special-casing
+- Authorization is still required: maintains consistent auth semantics across all entry points
+- No state advance: ensures stream IDs remain contiguous and predictable
+- Idempotent: enables safe retry logic in integrators
+
+#### Scope Note
+
+These guarantees are limited to `create_streams` creation semantics. They do not change withdrawal, pause/resume, cancellation, or cleanup rules.
+
+### batch_withdraw: Recipient-Only Auth, Completed Stream Handling, and Empty Vector Semantics
+
+`batch_withdraw(recipient, stream_ids)` enforces recipient-only authorization and deterministic completion semantics:
+
+#### Non-Empty Batch Semantics
+
+- Auth boundary: only the stream `recipient` can authorize `batch_withdraw`.
 - Non-recipient calls fail before transfer/state/event side effects.
-- Zero-withdrawable path returns `0` and emits no withdraw/completed events.
-- Completion transition: only an `Active` stream can transition to `Completed` on final drain.
-- Cancelled streams may still be withdrawn (accrued portion), but status remains `Cancelled`.
+- Uniqueness check: `stream_ids` must not contain duplicates; duplicates panic and revert the entire batch.
+- Completed streams: contribute a zero-amount result and are skipped silently (no error, no event).
+- Active/Paused streams: processed normally; `Paused` streams panic and revert the entire batch.
 - Event ordering on active final drain: `withdrew` is emitted before `completed`.
+
+#### Empty Vector Semantics
+
+When `stream_ids` is an empty vector:
+
+**Success Behavior (Observable):**
+- Returns `Ok(Vec::new())` (empty result vector)
+- No streams are processed
+- No tokens are transferred
+- No events are emitted
+- Contract state remains unchanged
+- Authorization is still required: `recipient.require_auth()` is called and must succeed
+- No errors are raised (empty batch is valid and succeeds)
+
+**Failure Behavior (Observable):**
+- If `recipient` is not authorized: authorization failure before any state changes
+- If contract is globally paused: `ContractError::ContractPaused` returned, no state changes
+- Any failure is atomic: no state mutation, no token transfer, no events
+
+**Invariants After Empty Batch:**
+- Returned vector has length 0
+- No stream state changed
+- Token balances unchanged
+- No new events in event log
+- Multiple empty batches have identical observable effects (idempotent)
+
+**Rationale:**
+- Empty batch is a valid no-op: allows callers to submit conditional batches without special-casing
+- Authorization is still required: maintains consistent auth semantics across all entry points
+- Idempotent: enables safe retry logic in integrators
 
 ---
 
