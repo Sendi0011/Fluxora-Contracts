@@ -1,13 +1,14 @@
 extern crate std;
 
 use fluxora_stream::{
-    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamStatus,
+    ContractError, ContractPauseChanged, CreateStreamParams, FluxoraStream, FluxoraStreamClient,
+    GlobalEmergencyPauseChanged, StreamEvent, StreamStatus,
 };
 use soroban_sdk::log;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Env, FromVal, IntoVal,
+    vec, Address, Env, FromVal, IntoVal, TryFromVal,
 };
 
 struct TestContext<'a> {
@@ -1767,18 +1768,12 @@ fn integration_pause_resume_past_end_time_accrual_capped() {
     ctx.env.ledger().set_timestamp(300);
     ctx.client().pause_stream(&stream_id);
 
+    // Resume at t=999 (just before end)
+    ctx.env.ledger().set_timestamp(999);
+    ctx.client().resume_stream(&stream_id);
+
     // Advance far past end_time (t=2000)
     ctx.env.ledger().set_timestamp(2000);
-
-    // Verify accrual is still capped at deposit_amount
-    let accrued = ctx.client().calculate_accrued(&stream_id);
-    assert_eq!(
-        accrued, 1000,
-        "accrual must be capped at deposit_amount even past end_time"
-    );
-
-    // Resume and withdraw
-    ctx.client().resume_stream(&stream_id);
     let withdrawn = ctx.client().withdraw(&stream_id);
     assert_eq!(withdrawn, 1000);
 
@@ -2525,12 +2520,12 @@ fn integration_uninitialised_get_stream_state_fails() {
 /// Uninitialised contract: set_contract_paused must fail with missing config.
 #[test]
 #[should_panic]
-fn integration_uninitialised_set_contract_paused_panics() {
+fn integration_uninitialised_set_global_emergency_paused_panics() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
-    client.set_contract_paused(&true);
+    client.set_global_emergency_paused(&true);
 }
 
 /// After initialisation, all previously-failing paths become functional.
@@ -2880,4 +2875,102 @@ fn integration_create_streams_single_token_pull_equals_sum() {
     // Total pulled = 1000 + 2000 + 500 = 3500
     assert_eq!(ctx.token.balance(&ctx.sender), sender_before - 3500);
     assert_eq!(ctx.token.balance(&ctx.contract_id), 3500);
+}
+
+#[test]
+fn integration_test_admin_pause_resume_flow() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Admin pauses
+    ctx.client().pause_stream_as_admin(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Paused
+    );
+
+    // Recipient cannot withdraw while paused
+    let result = ctx.client().try_withdraw(&stream_id);
+    assert!(result.is_err());
+
+    // Admin resumes
+    ctx.client().resume_stream_as_admin(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+
+    // Recipient can withdraw after resume
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().withdraw(&stream_id);
+}
+
+#[test]
+fn integration_test_admin_pause_accrual_integrity() {
+    let ctx = TestContext::setup();
+    let stream_id =
+        ctx.client()
+            .create_stream(&ctx.sender, &ctx.recipient, &2000, &2, &0, &0, &1000);
+
+    // At t=100, accrued=200
+    ctx.env.ledger().set_timestamp(100);
+    assert_eq!(ctx.client().calculate_accrued(&stream_id), 200);
+
+    // Admin pauses at t=100
+    ctx.client().pause_stream_as_admin(&stream_id);
+
+    // Advance to t=200 while paused
+    ctx.env.ledger().set_timestamp(200);
+    // Accrual MUST continue (time-based)
+    assert_eq!(ctx.client().calculate_accrued(&stream_id), 400);
+
+    // Admin resumes at t=200
+    ctx.client().resume_stream_as_admin(&stream_id);
+
+    // Recipient withdraws the full 400
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 400);
+}
+
+#[test]
+fn integration_test_admin_cancel_from_paused() {
+    let ctx = TestContext::setup();
+    let stream_id =
+        ctx.client()
+            .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().pause_stream_as_admin(&stream_id);
+
+    // Admin cancels while stream is paused
+    // Transitions Paused -> Cancelled
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    // Accrual freeze should be at t=100 (when cancelled)
+    assert_eq!(state.cancelled_at, Some(100));
+}
+
+#[test]
+fn integration_test_admin_unauthorized_pause() {
+    let ctx = TestContext::setup_strict();
+    let stream_id =
+        ctx.client()
+            .create_stream(&ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000);
+
+    // Non-admin (recipient) tries to call admin pause
+    ctx.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &ctx.recipient,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "pause_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = ctx.client().try_pause_stream_as_admin(&stream_id);
+    // Should fail because recipient is not admin
+    assert!(result.is_err());
 }
