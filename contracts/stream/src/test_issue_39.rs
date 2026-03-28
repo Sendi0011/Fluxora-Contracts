@@ -82,9 +82,9 @@ fn test_withdraw_cap_contract_balance_safety() {
     // Now contract balance is 600, but accrued - withdrawn is 1000.
     // Withdrawal should be capped at 600.
     let _withdrawable = ctx.client().get_withdrawable(&stream_id); // This usually follows the same logic
-                                                                  // Wait, get_withdrawable also needs to be updated or it will show 1000.
-                                                                  // The requirement said "In withdraw, compute withdrawable as min(...)".
-                                                                  // I should also update get_withdrawable for consistency if possible.
+                                                                   // Wait, get_withdrawable also needs to be updated or it will show 1000.
+                                                                   // The requirement said "In withdraw, compute withdrawable as min(...)".
+                                                                   // I should also update get_withdrawable for consistency if possible.
 
     let amt = ctx.client().withdraw(&stream_id);
     assert_eq!(

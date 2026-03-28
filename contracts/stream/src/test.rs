@@ -7,9 +7,7 @@ use soroban_sdk::{
     Address, Env, IntoVal,
 };
 
-use crate::{
-    Config, ContractError, FluxoraStream, FluxoraStreamClient,
-};
+use crate::{Config, ContractError, FluxoraStream, FluxoraStreamClient};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -16194,7 +16192,7 @@ mod i128_boundary_streams {
         let rate: i128 = 1;
         let duration: u64 = 1_000;
         let _large_deposit: i128 = rate * duration as i128; // exactly 1000
-                                                           // Mint a large amount but use a clean deposit for precision
+                                                            // Mint a large amount but use a clean deposit for precision
         let large_deposit: i128 = i128::MAX / 1_000_000 / 1_000 * 1_000; // divisible by 1000
         let rate: i128 = large_deposit / 1_000;
         let (env, contract_id, token_id, _a, sender, recipient) = setup_with_balance(large_deposit);
