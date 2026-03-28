@@ -9017,7 +9017,7 @@ fn test_update_rate_per_second_rejects_cancelled_stream() {
 #[test]
 fn test_update_rate_per_second_works_on_paused_stream() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9067,7 +9067,7 @@ fn test_update_rate_per_second_rejects_negative_rate() {
 #[should_panic]
 fn test_update_rate_per_second_rejects_rate_decrease() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with rate 5.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9145,7 +9145,7 @@ fn test_update_rate_per_second_after_cliff() {
 #[test]
 fn test_update_rate_per_second_near_end_time() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9180,7 +9180,7 @@ fn test_update_rate_per_second_near_end_time() {
 #[test]
 fn test_update_rate_per_second_after_end_time() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9210,7 +9210,7 @@ fn test_update_rate_per_second_after_end_time() {
 #[test]
 fn test_update_rate_per_second_with_partial_withdrawal() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9240,7 +9240,7 @@ fn test_update_rate_per_second_with_partial_withdrawal() {
     let accrued = ctx.client().calculate_accrued(&stream_id);
     // elapsed = 400, rate = 5 → 2000 accrued.
     assert_eq!(accrued, 2000);
-    
+
     let withdrawable = accrued - state.withdrawn_amount;
     assert_eq!(withdrawable, 1700);
 }
@@ -9248,7 +9248,7 @@ fn test_update_rate_per_second_with_partial_withdrawal() {
 #[test]
 fn test_update_rate_per_second_emits_event() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9278,14 +9278,18 @@ fn test_update_rate_per_second_emits_event() {
         })
         .collect();
 
-    assert_eq!(rate_update_events.len(), 1, "Should emit exactly one rate_upd event");
+    assert_eq!(
+        rate_update_events.len(),
+        1,
+        "Should emit exactly one rate_upd event"
+    );
 }
 
 #[test]
 #[should_panic]
 fn test_update_rate_per_second_unauthorized_caller() {
     let ctx = TestContext::setup_strict();
-    
+
     // Create stream.
     use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
     ctx.env.mock_auths(&[MockAuth {
@@ -9306,7 +9310,7 @@ fn test_update_rate_per_second_unauthorized_caller() {
             sub_invokes: &[],
         },
     }]);
-    
+
     let stream_id = ctx.client().create_stream(
         &ctx.sender,
         &ctx.recipient,
@@ -9334,7 +9338,7 @@ fn test_update_rate_per_second_nonexistent_stream() {
 #[test]
 fn test_update_rate_per_second_multiple_times() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with very generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9350,21 +9354,21 @@ fn test_update_rate_per_second_multiple_times() {
     // First update: 1 → 5.
     ctx.env.ledger().set_timestamp(100);
     ctx.client().update_rate_per_second(&stream_id, &5_i128);
-    
+
     let state1 = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state1.rate_per_second, 5);
 
     // Second update: 5 → 10.
     ctx.env.ledger().set_timestamp(200);
     ctx.client().update_rate_per_second(&stream_id, &10_i128);
-    
+
     let state2 = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state2.rate_per_second, 10);
 
     // Third update: 10 → 50.
     ctx.env.ledger().set_timestamp(300);
     ctx.client().update_rate_per_second(&stream_id, &50_i128);
-    
+
     let state3 = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state3.rate_per_second, 50);
 }
@@ -9372,7 +9376,7 @@ fn test_update_rate_per_second_multiple_times() {
 #[test]
 fn test_update_rate_per_second_preserves_other_fields() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with specific parameters.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9409,12 +9413,12 @@ fn test_update_rate_per_second_preserves_other_fields() {
 #[test]
 fn test_update_rate_per_second_with_overflow_protection() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with max-ish values.
     ctx.env.ledger().set_timestamp(0);
     let max_rate = i128::MAX / 1000; // Safe rate for 1000 second duration.
     let deposit = max_rate * 1000;
-    
+
     let stream_id = ctx.client().create_stream(
         &ctx.sender,
         &ctx.recipient,
@@ -9426,14 +9430,19 @@ fn test_update_rate_per_second_with_overflow_protection() {
     );
 
     // Attempt to update to a rate that would overflow.
-    let result = ctx.client().try_update_rate_per_second(&stream_id, &(max_rate + 1));
-    assert!(result.is_err(), "Should fail due to overflow or insufficient deposit");
+    let result = ctx
+        .client()
+        .try_update_rate_per_second(&stream_id, &(max_rate + 1));
+    assert!(
+        result.is_err(),
+        "Should fail due to overflow or insufficient deposit"
+    );
 }
 
 #[test]
 fn test_update_rate_per_second_interaction_with_pause_resume() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9467,7 +9476,7 @@ fn test_update_rate_per_second_interaction_with_pause_resume() {
 #[test]
 fn test_update_rate_per_second_exact_deposit_coverage() {
     let ctx = TestContext::setup();
-    
+
     // Create stream where deposit exactly covers rate * duration.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9484,7 +9493,10 @@ fn test_update_rate_per_second_exact_deposit_coverage() {
     // deposit = 1000, duration = 1000, so max rate = 1.
     // Cannot increase rate without exceeding deposit.
     let result = ctx.client().try_update_rate_per_second(&stream_id, &2_i128);
-    assert!(result.is_err(), "Should fail: new rate would require 2000 but deposit is only 1000");
+    assert!(
+        result.is_err(),
+        "Should fail: new rate would require 2000 but deposit is only 1000"
+    );
 }
 
 // ---------------------------------------------------------------------------

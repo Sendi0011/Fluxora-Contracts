@@ -1449,7 +1449,7 @@ impl FluxoraStream {
         // Emit event with old and new admin addresses
         env.events()
             .publish((symbol_short!("AdminUpd"),), (old_admin, new_admin));
-        
+
         Ok(())
     }
 
