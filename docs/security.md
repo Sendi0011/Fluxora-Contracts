@@ -73,6 +73,8 @@ The contract interacts with exactly one token, fixed at `init` time and stored i
 If a malicious token is used, the CEI ordering above reduces (but does not eliminate)
 reentrancy impact — state will already reflect the current operation when the re-entry occurs.
 
+**Comprehensive documentation**: See [`token-assumptions.md`](token-assumptions.md) for the complete token trust model, explicit non-goals, and residual risks.
+
 ---
 
 ## Authorization paths
@@ -139,5 +141,98 @@ instance storage under `DataKey::GlobalPaused`.
 - It requires `admin.require_auth()` from the declared bootstrap admin.
 - It checks `DataKey::Config` and panics with `"already initialised"` on any second call.
 
+This ordering ensures that if a downstream token contract or hook re-enters the stream contract, the on-chain state (e.g. `withdrawn_amount`, `status`) already reflects the current operation, limiting reentrancy impact. For broader reentrancy mitigation, see [Issue #55](https://github.com/Fluxora-Org/Fluxora-Contracts/issues/55).
+
+## Arithmetic Safety
+
+The contract employs exhaustive arithmetic safety checks across all fund-related operations. 
+
+- **Checked Math**: All additions and multiplications involving `deposit_amount`, `rate_per_second`, or stream durations use `checked_*` methods to prevent overflows.
+- **Structured Error Signals**: Arithmetic failures (such as a batch deposit exceeding `i128::MAX`) no longer trigger generic string-based panics. Instead, they emit a formal `ContractError::ArithmeticOverflow` (code 6). This provides crisp, programmable failure semantics for indexers, wallets, and treasury tooling.
+- **Defensive Ordering**: In `top_up_stream`, the overflow check is performed **before** the token transfer. This prevents unnecessary token movement (and associated gas costs) for transactions destined to fail.
+- **Accrual Capping**: Per-second accrual math implicitly caps at the `deposit_amount` on multiplication overflow, ensuring that technical overflows cannot be exploited to drain the contract beyond its funded limits.
 This prevents unauthorized bootstrap and prevents later repointing to a different token
 address or replacing the admin through `init`.
+
+---
+
+## Malicious Token Assumptions and Non-Goals
+
+The streaming contract makes explicit assumptions about token behavior and defines clear non-goals for malicious token scenarios. These are documented in detail in [`token-assumptions.md`](token-assumptions.md).
+
+### Key Assumptions
+
+1. **No reentrancy**: The token contract does not call back into the streaming contract during transfers.
+2. **Explicit failures**: The token contract panics or returns errors on insufficient balance/allowance, rather than silently failing.
+3. **Standard SEP-41 interface**: The token implements the standard Soroban token interface.
+4. **Deterministic behavior**: Token operations produce consistent, predictable results.
+
+### Explicit Non-Goals
+
+The following are **intentionally not mitigated** by the streaming contract:
+
+1. **Malicious token contracts**: The contract does not protect against tokens that violate SEP-41 guarantees.
+2. **Token supply manipulation**: The contract does not monitor or restrict token supply changes.
+3. **Token upgradeability**: The contract does not protect against token contract upgrades that change behavior.
+4. **Token balance verification**: The contract does not verify that actual token balances match internal accounting.
+5. **Token allowance management**: The contract does not manage token allowances on behalf of users.
+6. **Token decimals and precision**: The contract does not enforce or verify token decimal precision.
+
+### Rationale
+
+These non-goals are intentional design choices that:
+- Reduce gas overhead and complexity
+- Allow permissionless composability with any SEP-41 token
+- Simplify the contract logic
+- Place responsibility on token deployers and operators
+
+### Residual Risks
+
+1. **Non-standard tokens**: If a token violates SEP-41 guarantees, behavior may become unpredictable.
+2. **Direct transfers**: Tokens sent directly to the contract address are permanently locked.
+3. **Token upgrades**: If a token contract is upgraded to violate SEP-41 guarantees, behavior may change.
+
+**Mitigation**: Use only well-audited, standard SEP-41 tokens. See [`token-assumptions.md`](token-assumptions.md) for detailed integration guidelines.
+
+---
+
+## Reproducible WASM builds
+
+The CI pipeline verifies that the WASM artifact produced by `cargo build --release --target wasm32-unknown-unknown` matches a committed reference checksum in `wasm/checksums.sha256`. This ensures that:
+
+1. **Byte-identical output**: Any developer or CI runner with the pinned toolchain produces the same WASM binary.
+2. **Supply chain integrity**: Changes to dependencies or toolchain that alter the WASM output are detected before merge.
+3. **Auditability**: Auditors can independently rebuild and verify the deployed WASM matches the source.
+
+### Determinism contract
+
+| Factor                     | How it is pinned                                                |
+|---------------------------|-----------------------------------------------------------------|
+| Rust toolchain            | `rust-toolchain.toml` — `channel = "stable"`, targets pinned    |
+| soroban-sdk version       | `contracts/stream/Cargo.toml` — `21.7.7` exact version          |
+| Build profile             | `--release` with `wasm32-unknown-unknown` target                |
+| Feature flags             | Only default features during WASM build (`testutils` is test-only) |
+| `Cargo.lock`              | Committed; transitive dependencies locked                       |
+
+### CI verification flow
+
+1. Build WASM with pinned toolchain
+2. Compute `sha256sum` of the artifact
+3. Compare against `wasm/checksums.sha256`
+4. Fail with actionable error if mismatch detected
+
+### Updating checksums
+
+When the contract source changes intentionally:
+
+```bash
+bash script/update-wasm-checksums.sh
+git add wasm/checksums.sha256
+git commit -m "chore: update wasm checksums"
+```
+
+### Residual risks
+
+- **Optimized WASM**: The Stellar CLI `optimize` step may produce non-deterministic output. The reference checksum covers only the raw (unoptimized) WASM.
+- **Cross-host builds**: The pinned `wasm32-unknown-unknown` target is deterministic across hosts, but minor differences in host libc or linker could theoretically affect non-WASM builds.
+- **Dependency supply chain**: A compromised transitive dependency could alter WASM output. The `Cargo.lock` pin and checksum verification detect this at CI time.
