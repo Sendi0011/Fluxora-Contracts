@@ -139,5 +139,15 @@ instance storage under `DataKey::GlobalPaused`.
 - It requires `admin.require_auth()` from the declared bootstrap admin.
 - It checks `DataKey::Config` and panics with `"already initialised"` on any second call.
 
+This ordering ensures that if a downstream token contract or hook re-enters the stream contract, the on-chain state (e.g. `withdrawn_amount`, `status`) already reflects the current operation, limiting reentrancy impact. For broader reentrancy mitigation, see [Issue #55](https://github.com/Fluxora-Org/Fluxora-Contracts/issues/55).
+
+## Arithmetic Safety
+
+The contract employs exhaustive arithmetic safety checks across all fund-related operations. 
+
+- **Checked Math**: All additions and multiplications involving `deposit_amount`, `rate_per_second`, or stream durations use `checked_*` methods to prevent overflows.
+- **Structured Error Signals**: Arithmetic failures (such as a batch deposit exceeding `i128::MAX`) no longer trigger generic string-based panics. Instead, they emit a formal `ContractError::ArithmeticOverflow` (code 6). This provides crisp, programmable failure semantics for indexers, wallets, and treasury tooling.
+- **Defensive Ordering**: In `top_up_stream`, the overflow check is performed **before** the token transfer. This prevents unnecessary token movement (and associated gas costs) for transactions destined to fail.
+- **Accrual Capping**: Per-second accrual math implicitly caps at the `deposit_amount` on multiplication overflow, ensuring that technical overflows cannot be exploited to drain the contract beyond its funded limits.
 This prevents unauthorized bootstrap and prevents later repointing to a different token
 address or replacing the admin through `init`.

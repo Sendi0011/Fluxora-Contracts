@@ -21,14 +21,15 @@ pub fn calculate_accrued_amount(
         return 0;
     }
 
-    if start_time >= end_time || rate_per_second < 0 {
+    if rate_per_second < 0 {
         return 0;
     }
 
     let elapsed_now = current_time.min(end_time);
-    let elapsed_seconds = match elapsed_now.checked_sub(start_time) {
-        Some(elapsed) => elapsed as i128,
-        None => return 0,
+    let elapsed_seconds = if elapsed_now < start_time {
+        0
+    } else {
+        (elapsed_now - start_time) as i128
     };
 
     let accrued = match elapsed_seconds.checked_mul(rate_per_second) {
@@ -409,24 +410,25 @@ mod property_monotonicity {
     /// high-rate (deposit-capped), zero-rate, and near-overflow.
     const STREAMS: &[(u64, u64, u64, i128, i128)] = &[
         // (start, cliff, end, rate, deposit)
-        (0, 0, 1_000, 1, 1_000),          // standard linear, no cliff
-        (0, 500, 1_000, 1, 1_000),         // cliff at midpoint
-        (0, 1_000, 1_000, 1, 1_000),       // cliff == end (degenerate: nothing ever accrues)
-        (1_000, 1_000, 2_000, 2, 2_000),   // non-zero start, rate=2
-        (0, 0, 1_000, 10, 5_000),          // high rate, deposit is binding cap
-        (0, 0, 10_000, 0, 0),              // zero rate, zero deposit
-        (0, 0, 1_000, 3, 500),             // rate*duration > deposit (deposit caps)
-        (0, 0, u64::MAX, 1, i128::MAX),    // near-overflow duration
-        (100, 200, 1_000, 5, 4_500),       // cliff after start
-        (0, 0, 1_000, 1, 2_000),           // deposit > rate*duration (excess deposit)
+        (0, 0, 1_000, 1, 1_000),         // standard linear, no cliff
+        (0, 500, 1_000, 1, 1_000),       // cliff at midpoint
+        (0, 1_000, 1_000, 1, 1_000),     // cliff == end (degenerate: nothing ever accrues)
+        (1_000, 1_000, 2_000, 2, 2_000), // non-zero start, rate=2
+        (0, 0, 1_000, 10, 5_000),        // high rate, deposit is binding cap
+        (0, 0, 10_000, 0, 0),            // zero rate, zero deposit
+        (0, 0, 1_000, 3, 500),           // rate*duration > deposit (deposit caps)
+        (0, 0, u64::MAX, 1, i128::MAX),  // near-overflow duration
+        (100, 200, 1_000, 5, 4_500),     // cliff after start
+        (0, 0, 1_000, 1, 2_000),         // deposit > rate*duration (excess deposit)
     ];
 
     /// Dense time grid for a stream: samples before, at, and after every boundary.
     fn time_grid(start: u64, cliff: u64, end: u64) -> [u64; 12] {
-        let mid = start.saturating_add((end.saturating_sub(start)) / 2);
-        let q1 = start.saturating_add((end.saturating_sub(start)) / 4);
-        let q3 = start.saturating_add(3 * (end.saturating_sub(start)) / 4);
-        [
+        let duration = end.saturating_sub(start);
+        let mid = start.saturating_add(duration / 2);
+        let q1 = start.saturating_add(duration / 4);
+        let q3 = start.saturating_add((duration / 4).saturating_mul(3));
+        let mut times = [
             0,
             start.saturating_sub(1),
             start,
@@ -439,7 +441,9 @@ mod property_monotonicity {
             end,
             end.saturating_add(1),
             end.saturating_add(1_000),
-        ]
+        ];
+        times.sort();
+        times
     }
 
     // -----------------------------------------------------------------------
@@ -606,7 +610,10 @@ mod property_monotonicity {
     #[test]
     fn prop_elapsed_zero_at_start_with_early_cliff() {
         let accrued = calculate_accrued_amount(500, 0, 1_000, 1, 1_000, 500);
-        assert_eq!(accrued, 0, "at start_time with early cliff, elapsed=0 so accrued=0");
+        assert_eq!(
+            accrued, 0,
+            "at start_time with early cliff, elapsed=0 so accrued=0"
+        );
     }
 
     /// One second past start with early cliff → accrues normally.
