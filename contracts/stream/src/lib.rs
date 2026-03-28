@@ -2,7 +2,9 @@
 
 mod accrual;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Env,
+};
 
 // ---------------------------------------------------------------------------
 // TTL constants
@@ -56,14 +58,16 @@ pub enum ContractError {
     ContractPaused = 4,
     /// Start time is before the current ledger timestamp.
     StartTimeInPast = 5,
+    /// Arithmetic overflow in stream calculations (e.g. deposit total).
+    ArithmeticOverflow = 6,
     /// Caller is not authorized to perform this operation.
-    Unauthorized = 6,
+    Unauthorized = 7,
     /// Contract is already initialized.
-    AlreadyInitialised = 7,
+    AlreadyInitialised = 8,
     /// Token balance or allowance is insufficient (emulated check if possible, otherwise caught by token client).
-    InsufficientBalance = 8,
+    InsufficientBalance = 9,
     /// Deposit amount does not cover the total streamable amount.
-    InsufficientDeposit = 9,
+    InsufficientDeposit = 10,
 }
 
 #[contracttype]
@@ -150,6 +154,13 @@ pub struct StreamToppedUp {
     pub new_deposit_amount: i128,
 }
 
+/// Emitted when the contract admin toggles the global emergency pause flag.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GlobalEmergencyPauseChanged {
+    pub paused: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
@@ -220,6 +231,24 @@ fn get_token(env: &Env) -> Result<Address, ContractError> {
 
 fn get_admin(env: &Env) -> Result<Address, ContractError> {
     get_config(env).map(|c| c.admin)
+}
+
+/// Returns whether the contract is in global emergency pause (default `false` if unset).
+fn is_global_emergency_paused(env: &Env) -> bool {
+    bump_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalEmergencyPaused)
+        .unwrap_or(false)
+}
+
+/// Panics when [`is_global_emergency_paused`] is true. Admin/admin-override entrypoints
+/// must not call this so operators can still intervene.
+fn require_not_globally_paused(env: &Env) {
+    assert!(
+        !is_global_emergency_paused(env),
+        "contract is globally paused"
+    );
 }
 
 fn read_stream_count(env: &Env) -> u64 {
@@ -426,7 +455,7 @@ impl FluxoraStream {
         let duration = (end_time - start_time) as i128;
         let total_streamable = rate_per_second
             .checked_mul(duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .ok_or(ContractError::ArithmeticOverflow)?; // overflow
 
         if deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -719,7 +748,9 @@ impl FluxoraStream {
             )?;
             total_deposit = total_deposit
                 .checked_add(params.deposit_amount)
-                .ok_or(ContractError::InvalidParams)?; // overflow
+                .unwrap_or_else(|| {
+                    panic_with_error!(env, ContractError::ArithmeticOverflow);
+                });
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas.
@@ -897,6 +928,7 @@ impl FluxoraStream {
     /// - Cancel at 100% completion → sender gets 0% refund, recipient can withdraw 100%
     /// - Cancel before cliff → sender gets 100% refund (no accrual before cliff)
     pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
+        require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
         Self::require_stream_sender(&stream.sender);
         Self::cancel_stream_internal(&env, &mut stream)
@@ -959,6 +991,7 @@ impl FluxoraStream {
     /// - At t=800: withdraw() returns 500 tokens (800 - 300 already withdrawn)
     /// - At t=1000: withdraw() returns 200 tokens, status → Completed
     pub fn withdraw(env: Env, stream_id: u64) -> Result<i128, ContractError> {
+        require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
 
         // Enforce recipient-only authorization
@@ -1073,6 +1106,7 @@ impl FluxoraStream {
         stream_id: u64,
         destination: Address,
     ) -> Result<i128, ContractError> {
+        require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
 
         stream.recipient.require_auth();
@@ -1136,7 +1170,7 @@ impl FluxoraStream {
     ///
     /// # Parameters
     /// - `recipient`: Address that must authorize and must be the recipient of all streams
-    /// - `stream_ids`: Stream IDs to withdraw from (can contain duplicates; each processed once)
+    /// - `stream_ids`: Stream IDs to withdraw from (**must be unique**; duplicates panic)
     ///
     /// # Returns
     /// - `Vec<BatchWithdrawResult>`: Per-stream `(stream_id, amount)` for each entry.
@@ -1161,7 +1195,21 @@ impl FluxoraStream {
         recipient: Address,
         stream_ids: soroban_sdk::Vec<u64>,
     ) -> Result<soroban_sdk::Vec<BatchWithdrawResult>, ContractError> {
+        require_not_globally_paused(&env);
         recipient.require_auth();
+
+        let n = stream_ids.len();
+        for i in 0..n {
+            let a = stream_ids.get(i).unwrap();
+            let mut j = i + 1;
+            while j < n {
+                assert!(
+                    stream_ids.get(j).unwrap() != a,
+                    "batch_withdraw stream_ids must be unique"
+                );
+                j += 1;
+            }
+        }
 
         let mut results = soroban_sdk::Vec::new(&env);
 
@@ -1400,6 +1448,15 @@ impl FluxoraStream {
         get_config(&env)
     }
 
+    /// Returns `true` when the contract is in **global emergency pause**.
+    ///
+    /// In this mode, routine user-facing mutations (create, withdraw, sender pause/resume/cancel,
+    /// schedule updates, `top_up_stream`, `set_admin`) revert; views and admin override entrypoints
+    /// still run. See protocol docs for the full matrix.
+    pub fn get_global_emergency_paused(env: Env) -> bool {
+        is_global_emergency_paused(&env)
+    }
+
     /// Update the admin address for the contract.
     ///
     /// Allows the current admin to rotate the admin key by setting a new admin address.
@@ -1534,6 +1591,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_rate_per_second: i128,
     ) -> Result<(), ContractError> {
+        require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can update the rate.
@@ -1558,7 +1616,9 @@ impl FluxoraStream {
         let duration = (stream.end_time - stream.start_time) as i128;
         let total_streamable = new_rate_per_second
             .checked_mul(duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         if stream.deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -1614,6 +1674,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_end_time: u64,
     ) -> Result<(), ContractError> {
+        require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can modify the schedule.
@@ -1637,7 +1698,9 @@ impl FluxoraStream {
         let new_max_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         // Deposit must still be sufficient to cover the shortened schedule (by construction
         // this should hold given the original validation, but we keep an explicit assert).
@@ -1701,6 +1764,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_end_time: u64,
     ) -> Result<(), ContractError> {
+        require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can modify the schedule.
@@ -1725,7 +1789,9 @@ impl FluxoraStream {
         let new_total_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         if new_total_streamable > stream.deposit_amount {
             return Err(ContractError::InsufficientDeposit);
@@ -1762,9 +1828,7 @@ impl FluxoraStream {
     ///
     /// # Authorization
     /// - Requires authorization from `funder`.
-    /// - No special relationship between `funder` and the original `sender` is enforced
-    ///   by the contract; protocol operators should constrain who can call this entrypoint
-    ///   at the application layer (e.g. only treasury multisig).
+    /// - `funder` must be either the stream's `sender` or the contract `admin` (from `Config`).
     ///
     /// # Behaviour
     /// - Pulls `amount` tokens from `funder` into the contract.
@@ -1803,7 +1867,7 @@ impl FluxoraStream {
         stream.deposit_amount = stream
             .deposit_amount
             .checked_add(amount)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .ok_or(ContractError::ArithmeticOverflow)?; // overflow
 
         save_stream(&env, &stream);
 
@@ -1821,15 +1885,6 @@ impl FluxoraStream {
         Ok(())
     }
 
-    /// Return the contract version number.
-    ///
-    /// Reads the compile-time `CONTRACT_VERSION` constant — no storage access required.
-    /// Frontends and deployment scripts can call this to confirm which version of the
-    /// contract is currently deployed before interacting with it.
-    ///
-    /// # Returns
-    /// - `u32`: The current contract version (currently `1`)
-    ///
     /// Close (archive) a completed stream to reduce long-term storage.
     ///
     /// Permanently removes the stream's persistent storage entry. Only streams in
@@ -1855,6 +1910,7 @@ impl FluxoraStream {
     ///
     /// # Operational guidance
     /// - Callable by anyone; no authorization required (permissionless cleanup).
+    /// - Not blocked by global emergency pause (storage hygiene only).
     /// - Indexers and UIs should treat closed stream IDs as non-existent.
     /// - Do not close streams that might still need historical data for accounting.
     pub fn close_completed_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
@@ -2153,6 +2209,32 @@ impl FluxoraStream {
             StreamEvent::Resumed(stream_id),
         );
         Ok(())
+    }
+
+    /// Set or clear the **global emergency pause** flag (admin only).
+    ///
+    /// When `paused == true`, routine user-facing mutations revert with
+    /// `"contract is globally paused"`. Admin override entrypoints
+    /// (`*_as_admin`, this function) and read-only views are not blocked.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Events
+    /// - Publishes topic `gl_pause` with [`GlobalEmergencyPauseChanged`] data.
+    pub fn set_global_emergency_paused(env: Env, paused: bool) {
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalEmergencyPaused, &paused);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("gl_pause"),),
+            GlobalEmergencyPauseChanged { paused },
+        );
     }
 }
 

@@ -26,6 +26,7 @@ This table lists all possible errors in the FluxoraStream contract, including bo
 | `stream is not paused`                          | Admin cannot resume a stream that is not paused                                | `resume_stream_as_admin` |
 | `Unauthorized`                                  | Caller is not authorized to perform this operation                             | `init` (bootstrap admin auth), `set_admin`, `require_stream_sender` (internal checks) |
 | `InsufficientBalance`                           | Token transfer failed due to insufficient balance or allowance                 | `create_stream`, `cancel_stream`, `cancel_stream_as_admin`, `withdraw` |
+| `ArithmeticOverflow` (error code 6) | Arithmetic overflow in stream calculations (e.g. deposit total) | `create_stream`, `create_streams`, `update_rate_per_second`, `shorten_stream_end_time`, `extend_stream_end_time`, `top_up_stream` |
 | `Overflow calculating total streamable amount` | Overflow occurred when calculating total streamable tokens                     | `create_stream`, `create_streams` |
 | `overflow calculating total batch deposit`     | Overflow occurred when summing deposits across batch entries                   | `create_streams` |
 | `can only close completed streams`             | Stream must be Completed to be closed                                           | `close_completed_stream` |
