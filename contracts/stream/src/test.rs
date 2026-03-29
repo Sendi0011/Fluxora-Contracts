@@ -15429,7 +15429,7 @@ fn test_batch_withdraw_mixed_stream_states_comprehensive() {
     assert_eq!(results.get(3).unwrap().amount, 1600);
 
     // Verify total tokens transferred
-    let expected_total = 800 + 500 + 0 + 1600;
+    let expected_total = 800 + 500 + 1600;
     assert_eq!(ctx.token().balance(&ctx.recipient), 1000 + expected_total); // 1000 from id_completed earlier
 }
 
@@ -16090,8 +16090,11 @@ mod i128_boundary_streams {
 
     /// A safe large deposit: rate=1, duration=i128::MAX/2 seconds.
     /// Avoids rate*duration overflow while exercising large deposit values.
-    const LARGE_DEPOSIT_RATE1: i128 = 1_000_000_000_000_000_000_i128; // 10^18
-    const LARGE_DEPOSIT_DURATION: u64 = 1_000_000_000_000_000_000_u64; // 10^18 s
+    // const LARGE_DEPOSIT_RATE1: i128 = 1_000_000_000_000_000_000_i128; // 10^18
+    // const LARGE_DEPOSIT_DURATION: u64 = 1_000_000_000_000_000_000_u64; // 10^18 s
+
+    const _LARGE_DEPOSIT_RATE1: i128 = 1_000_000_000_000_000_000_i128;
+    const _LARGE_DEPOSIT_DURATION: u64 = 1_000_000_000_000_000_000_u64;
 
     fn setup_with_balance(balance: i128) -> (Env, Address, Address, Address, Address, Address) {
         let env = Env::default();
