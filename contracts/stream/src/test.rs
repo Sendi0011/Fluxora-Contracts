@@ -15248,13 +15248,17 @@ fn test_create_streams_batch_recipient_index_consistency() {
             recipient: recipient1.clone(),
             deposit_amount: 500,
             rate_per_second: 1,
-            start_time: 0,
-            cliff_time: 0,
-            end_time: 500,
+            start_time: 110,
+            cliff_time: 110,
+            end_time: 610,
         }],
     );
 
-    let ids2 = ctx.client().create_streams(&ctx.sender, &params2);
+    let ids2_res = ctx.client().try_create_streams(&ctx.sender, &params2);
+    if let Err(res) = ids2_res {
+        panic!("create_streams failed with error: {:?}", res);
+    }
+    let ids2 = ids2_res.unwrap().unwrap();
     assert_eq!(ids2.get(0).unwrap(), 5); // Next ID should be 5
 
     // Verify recipient1 now has streams 2 and 5 (sorted)
