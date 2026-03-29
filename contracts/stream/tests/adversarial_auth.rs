@@ -663,7 +663,7 @@ fn adversarial_batch_withdraw_stranger_rejected_no_side_effects() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "batch_withdraw",
-            args: (&stranger, &ids).into_val(&ctx.env),
+            args: (&stranger, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -698,7 +698,7 @@ fn adversarial_batch_withdraw_sender_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "batch_withdraw",
-            args: (&ctx.sender, &ids).into_val(&ctx.env),
+            args: (&ctx.sender, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -763,7 +763,7 @@ fn adversarial_batch_withdraw_cross_stream_recipient_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "batch_withdraw",
-            args: (&ctx.recipient, &ids).into_val(&ctx.env),
+            args: (&ctx.recipient, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -1107,11 +1107,11 @@ fn adversarial_set_contract_paused_stranger_rejected() {
             args: (
                 &ctx.sender,
                 &ctx.recipient,
-                &1000_i128,
-                &1_i128,
-                &0u64,
-                &0u64,
-                &1000u64,
+                1000_i128,
+                1_i128,
+                0u64,
+                0u64,
+                1000u64,
             )
                 .into_val(&ctx.env),
             sub_invokes: &[MockAuthInvoke {
@@ -1276,11 +1276,11 @@ fn adversarial_extend_end_time_stranger_rejected_no_side_effects() {
             args: (
                 &ctx.sender,
                 &ctx.recipient,
-                &2000_i128,
-                &1_i128,
-                &0u64,
-                &0u64,
-                &1000u64,
+                2000_i128,
+                1_i128,
+                0u64,
+                0u64,
+                1000u64,
             )
                 .into_val(&ctx.env),
             sub_invokes: &[MockAuthInvoke {
