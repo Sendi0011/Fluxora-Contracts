@@ -16629,6 +16629,10 @@ mod recipient_index_stress {
         let ctx = TestContext::setup();
         let recipient = Address::generate(&ctx.env);
 
+        // Mint sufficient tokens for 100 streams (100 * 1000 = 100,000)
+        // Default setup only mints 10,000.
+        ctx.sac.mint(&ctx.sender, &1_000_000_i128);
+
         // Stress test: Create 100 streams for one recipient
         // We use increments of 50 to avoid any single-call resource limits
         let batch_size = 50;
