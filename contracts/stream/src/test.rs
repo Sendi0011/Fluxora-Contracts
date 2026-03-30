@@ -16622,18 +16622,21 @@ mod i128_boundary_streams {
 #[cfg(test)]
 mod recipient_index_stress {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Vec};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Vec,
+    };
 
     #[test]
     fn test_recipient_index_stress_large_scale() {
         let ctx = TestContext::setup();
         let recipient = Address::generate(&ctx.env);
-        
+
         // Stress test: Create 500 streams for one recipient
         // We use increments of 50 to avoid any single-call resource limits
         let batch_size = 50;
         let total_batches = 10; // 500 streams total
-        
+
         for _ in 0..total_batches {
             let mut streams = Vec::new(&ctx.env);
             for _ in 0..batch_size {
@@ -16651,10 +16654,10 @@ mod recipient_index_stress {
 
         let index = ctx.client().get_recipient_streams(&recipient);
         assert_eq!(index.len(), 500);
-        
+
         // Verify sorted order
         for i in 0..999 {
-            assert!(index.get(i).unwrap() < index.get(i+1).unwrap());
+            assert!(index.get(i).unwrap() < index.get(i + 1).unwrap());
         }
     }
 
@@ -16662,20 +16665,20 @@ mod recipient_index_stress {
     fn test_close_cancelled_stream_cleans_index() {
         let ctx = TestContext::setup();
         let stream_id = ctx.create_default_stream();
-        
+
         // Cancel the stream
         ctx.client().cancel_stream(&stream_id);
-        
+
         let index_before = ctx.client().get_recipient_streams(&ctx.recipient);
         assert_eq!(index_before.len(), 1);
         assert_eq!(index_before.get(0).unwrap(), stream_id);
 
         // Close the cancelled stream (New feature verification)
         ctx.client().close_completed_stream(&stream_id);
-        
+
         let index_after = ctx.client().get_recipient_streams(&ctx.recipient);
         assert_eq!(index_after.len(), 0);
-        
+
         // Verify stream is deleted from storage
         let result = ctx.client().try_get_stream_state(&stream_id);
         assert!(result.is_err());
@@ -16685,56 +16688,53 @@ mod recipient_index_stress {
     fn test_recipient_index_consistency_after_many_removals() {
         let ctx = TestContext::setup();
         let recipient = Address::generate(&ctx.env);
-        
+
         // Create 10 streams
         let mut stream_ids = Vec::new(&ctx.env);
         for _ in 0..10 {
-            let id = ctx.client().create_stream(
-                &ctx.sender,
-                &recipient,
-                &1000,
-                &1,
-                &100,
-                &100,
-                &1100,
-            );
+            let id =
+                ctx.client()
+                    .create_stream(&ctx.sender, &recipient, &1000, &1, &100, &100, &1100);
             stream_ids.push_back(id);
         }
 
         // Close streams from middle (5), start (0), and end (9)
         // Note: IDs might not be 0-9 sequentially if multiple creation methods used,
         // but here they will be because it's a fresh setup.
-        
+
         // 1. Close middle (ID at index 5)
         // Make it Completed first
         ctx.env.ledger().set_timestamp(1101);
         ctx.client().withdraw(&stream_ids.get(5).unwrap());
-        ctx.client().close_completed_stream(&stream_ids.get(5).unwrap());
+        ctx.client()
+            .close_completed_stream(&stream_ids.get(5).unwrap());
 
         // 2. Close start (ID at index 0)
         ctx.client().withdraw(&stream_ids.get(0).unwrap());
-        ctx.client().close_completed_stream(&stream_ids.get(0).unwrap());
+        ctx.client()
+            .close_completed_stream(&stream_ids.get(0).unwrap());
 
         // 3. Close end (ID at index 9)
         ctx.client().withdraw(&stream_ids.get(9).unwrap());
-        ctx.client().close_completed_stream(&stream_ids.get(9).unwrap());
+        ctx.client()
+            .close_completed_stream(&stream_ids.get(9).unwrap());
 
         let index = ctx.client().get_recipient_streams(&recipient);
         assert_eq!(index.len(), 7);
-        
+
         // Verify targeted IDs are gone
         let dead_ids = [
             stream_ids.get(0).unwrap(),
             stream_ids.get(5).unwrap(),
-            stream_ids.get(9).unwrap()
+            stream_ids.get(9).unwrap(),
         ];
         for id in index.iter() {
             assert!(!dead_ids.contains(&id));
         }
-        
+
         // Verify sorted order remains
-        for i in 0..index.len()-1 {
-            assert!(index.get(i).unwrap() < index.get(i+1).unwrap());
+        for i in 0..index.len() - 1 {
+            assert!(index.get(i).unwrap() < index.get(i + 1).unwrap());
         }
     }
 }

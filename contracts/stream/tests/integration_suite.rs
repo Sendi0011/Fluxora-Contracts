@@ -3193,7 +3193,7 @@ fn integration_test_admin_unauthorized_pause() {
 fn test_recipient_index_stress_and_cleanup_lifecycle() {
     let ctx = TestContext::setup();
     let recipient = Address::generate(&ctx.env);
-    
+
     // 1. Create 100 streams for the recipient (batch creation)
     let batch_size = 50;
     for _ in 0..2 {
@@ -3241,7 +3241,7 @@ fn test_recipient_index_stress_and_cleanup_lifecycle() {
     // 5. Final verification: index should now have ONLY the 50 remaining streams
     let final_index = ctx.client().get_recipient_streams(&recipient);
     assert_eq!(final_index.len(), 50);
-    
+
     // Verify no ID drift: the first remaining ID should be ID 50
     assert_eq!(final_index.get(0).unwrap(), 50);
 }
