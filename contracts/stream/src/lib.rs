@@ -2247,7 +2247,7 @@ impl FluxoraStream {
     /// - If the stream is not `Completed` (Active, Paused, or Cancelled)
     ///
     /// # Events
-    /// - Publishes `closed(stream_id)` with `StreamEvent::StreamClosed(stream_id)` before removal
+    /// - Publishes `closed(stream_id)` with `StreamEvent::StreamClosed(stream_id)` before removal.
     ///
     /// # Operational guidance
     /// - Callable by anyone; no authorization required (permissionless cleanup).
@@ -2257,7 +2257,9 @@ impl FluxoraStream {
     pub fn close_completed_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
         let stream = load_stream(&env, stream_id)?;
 
-        if stream.status != StreamStatus::Completed {
+        // Only explicitly terminal streams (Completed or Cancelled) can be closed.
+        // Completed: fully withdrawn. Cancelled: refunded and terminated.
+        if stream.status != StreamStatus::Completed && stream.status != StreamStatus::Cancelled {
             return Err(ContractError::InvalidState);
         }
 

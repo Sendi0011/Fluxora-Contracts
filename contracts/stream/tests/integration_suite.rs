@@ -3188,3 +3188,60 @@ fn integration_test_admin_unauthorized_pause() {
     // Should fail because recipient is not admin
     assert!(result.is_err());
 }
+
+#[test]
+fn test_recipient_index_stress_and_cleanup_lifecycle() {
+    let ctx = TestContext::setup();
+    let recipient = Address::generate(&ctx.env);
+    
+    // 1. Create 100 streams for the recipient (batch creation)
+    let batch_size = 50;
+    for _ in 0..2 {
+        let mut streams = soroban_sdk::vec![&ctx.env];
+        for _ in 0..batch_size {
+            streams.push_back(CreateStreamParams {
+                recipient: recipient.clone(),
+                deposit_amount: 1000,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 1000,
+            });
+        }
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }
+
+    let count = ctx.client().get_recipient_stream_count(&recipient);
+    assert_eq!(count, 100);
+
+    // 2. Cancel 30 streams
+    let all_streams = ctx.client().get_recipient_streams(&recipient);
+    for i in 0..30 {
+        let id = all_streams.get(i).unwrap();
+        ctx.client().cancel_stream(&id);
+    }
+
+    // 3. Withdraw and complete 20 streams
+    ctx.env.ledger().set_timestamp(1001);
+    for i in 30..50 {
+        let id = all_streams.get(i).unwrap();
+        ctx.client().withdraw(&id);
+    }
+
+    // Count remains 100 because indexing includes terminal statuses until explicit cleanup
+    assert_eq!(ctx.client().get_recipient_stream_count(&recipient), 100);
+
+    // 4. Cleanup: Close all 50 terminal streams (30 cancelled + 20 completed)
+    // This verifies the new feature allowing Cancelled streams to be closed.
+    for i in 0..50 {
+        let id = all_streams.get(i).unwrap();
+        ctx.client().close_completed_stream(&id);
+    }
+
+    // 5. Final verification: index should now have ONLY the 50 remaining streams
+    let final_index = ctx.client().get_recipient_streams(&recipient);
+    assert_eq!(final_index.len(), 50);
+    
+    // Verify no ID drift: the first remaining ID should be ID 50
+    assert_eq!(final_index.get(0).unwrap(), 50);
+}

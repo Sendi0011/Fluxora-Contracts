@@ -46,7 +46,7 @@ Retrieve all stream IDs for a given recipient in sorted ascending order.
 - `Vec<u64>`: Vector of stream IDs (sorted ascending by stream_id)
   - Empty vector if the recipient has no streams
   - Includes streams in all statuses (Active, Paused, Completed, Cancelled)
-  - Does not include closed streams (removed via `close_completed_stream`)
+  - Does not include closed streams (removed via `close_completed_stream` or `close_stream` alias)
 
 **Behavior:**
 
@@ -115,7 +115,7 @@ After: recipient has streams [0, 2, 3, 5]  (sorted)
 
 ### Stream Closure
 
-When a completed stream is closed via `close_completed_stream`:
+When a terminal stream (Completed or Cancelled) is closed via `close_completed_stream`:
 
 1. Stream is removed from recipient's index
 2. Stream data is deleted from persistent storage
@@ -134,7 +134,7 @@ After: recipient has streams [0, 2, 5]
 Status changes (pause, resume, cancel, withdraw) do **not** affect the index:
 
 - **Pause/Resume**: Stream remains in index
-- **Cancel**: Stream remains in index (not removed until closed)
+- **Cancel**: Stream remains in index until explicitly closed (to reclaim index space)
 - **Withdraw**: Stream remains in index (even when completed)
 - **Close**: Stream is removed from index
 
@@ -194,7 +194,8 @@ To provide crisp assurances to integrators, the recipient index observes strict 
 
 1. **Time Boundaries**: The index is agnostic to start times, cliff times, or end times. Progressing ledger timestamps will **not** alter index composition. A stream remains in the index before its start and long after its end until explicitly closed.
 2. **Stream Status Configurations**: Active, Paused, and Cancelled streams persist within the index. Pause or Cancel operations neither remove nor re-append items to the index.
-3. **Numeric Bounds & Host Limits (Audit Note)**: The protocol does not actively bounded the maximum number of streams a single recipient can harbor. Extreme volumes of incoming streams to a single recipient could exceed Soroban's local storage read/write operational budgets, leading to out-of-gas (`HostError`) during insertion/lookup. Senders are responsible for ensuring they do not grief recipients by deliberately bloating their indexes.
+3. **Index Cleanup Protocol (Issue #307)**: To manage index stress (many streams per recipient), users or indexers should call `close_completed_stream` on terminal streams (`Completed` or `Cancelled`). This is a permissionless operation that reduces the O(N) cost of future index mutations for that recipient.
+4. **Numeric Bounds & Host Limits (Audit Note)**: The protocol does not actively bound the maximum number of streams a single recipient can harbor. Extreme volumes of incoming streams to a single recipient could exceed Soroban's local storage read/write operational budgets (~64KB entry limit, roughly 8,000 IDs), leading to out-of-gas (`HostError`) during insertion/lookup. Senders are responsible for ensuring they do not grief recipients by deliberately bloating their indexes.
 
 ## Performance Characteristics
 

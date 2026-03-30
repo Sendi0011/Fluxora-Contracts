@@ -48,7 +48,7 @@ No hidden rules or implementation details are required to understand protocol be
 - **Active** or **Paused** → **Cancelled** (terminal)
 - **Active** or **Paused** → **Completed** (when recipient withdraws full deposit; terminal)
 
-Terminal states: `Completed`, `Cancelled`. A stream is also considered technically terminal if `ledger.timestamp() >= end_time`.
+Terminal states: `Completed`, `Cancelled`. Both may be closed via `close_completed_stream` to reclaim storage and index space. A stream is also considered technically terminal if `ledger.timestamp() >= end_time`.
 In this "time-terminal" state, pause/resume is blocked, but withdrawal is always allowed regardless of previous pause status.
 
 ### Cancellation Semantics (Issue Scope)
@@ -360,7 +360,7 @@ On failure (`InvalidParams` or `InvalidState`):
 | `pause_stream_as_admin`   | Admin                         | `admin.require_auth()`                      |
 | `resume_stream_as_admin`  | Admin                         | `admin.require_auth()`                      |
 | `cancel_stream_as_admin`  | Admin                         | `admin.require_auth()`                      |
-| `close_completed_stream`  | Anyone                        | None (permissionless cleanup)               |
+| `close_completed_stream`  | Anyone                        | None (permissionless terminal cleanup)     |
 | `top_up_stream`           | Funder address                | `funder.require_auth()`                     |
 | `update_rate_per_second`  | Sender                        | `sender.require_auth()`                     |
 | `shorten_stream_end_time` | Sender                        | `sender.require_auth()`                     |
@@ -570,7 +570,7 @@ errors relevant to stream creation and timing.
 | `ContractError::Unauthorized` (6)                                       | Various                            | Auth check failed                             |
 | `ContractError::InvalidState` (2)                                       | `withdraw`                         | Withdraw from non-terminal paused             |
 | `ContractError::InvalidState` (2)                                       | `cancel_stream`                    | Cancel completed/cancelled                    |
-| `"can only close completed streams"`                                    | `close_completed_stream`           | Close non-Completed stream                    |
+| `"invalid state for stream closure"`                                    | `close_completed_stream`           | Close non-terminal (Active/Paused) stream    |
 | `"contract not initialised: missing config"`                            | Functions requiring config         | Config missing                                |
 
 ## Error Reference
