@@ -10006,6 +10006,92 @@ fn test_update_rate_per_second_emits_event() {
 }
 
 #[test]
+fn test_update_rate_per_second_on_paused_stream_after_partial_withdrawal() {
+    let ctx = TestContext::setup();
+
+    // Create stream with generous deposit.
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &10_000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1_000u64,
+    );
+
+    // At t=300, withdraw partial amount.
+    ctx.env.ledger().set_timestamp(300);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 300);
+
+    // Pause the stream.
+    ctx.client().pause_stream(&stream_id);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+    assert_eq!(state.withdrawn_amount, 300);
+
+    // Update rate while paused should succeed.
+    ctx.client().update_rate_per_second(&stream_id, &5_i128);
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after.rate_per_second, 5);
+    assert_eq!(state_after.status, StreamStatus::Paused);
+    assert_eq!(state_after.withdrawn_amount, 300);
+
+    // Accrued should use new rate retroactively.
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 300 * 5); // 1500
+
+    let withdrawable = accrued - state_after.withdrawn_amount;
+    assert_eq!(withdrawable, 1200);
+}
+
+#[test]
+fn test_update_rate_per_second_after_partial_withdrawal_then_resume_and_withdraw() {
+    let ctx = TestContext::setup();
+
+    // Create stream with generous deposit.
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &10_000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1_000u64,
+    );
+
+    // At t=200, withdraw partial amount.
+    ctx.env.ledger().set_timestamp(200);
+    let withdrawn1 = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn1, 200);
+
+    // Pause the stream.
+    ctx.client().pause_stream(&stream_id);
+
+    // Update rate while paused.
+    ctx.client().update_rate_per_second(&stream_id, &3_i128);
+
+    // Resume the stream.
+    ctx.client().resume_stream(&stream_id);
+
+    // At t=400, withdraw again.
+    ctx.env.ledger().set_timestamp(400);
+    let withdrawn2 = ctx.client().withdraw(&stream_id);
+    // Accrued at t=400 with rate=3: 400*3 = 1200
+    // Withdrawn so far: 200
+    // Withdrawable: 1000
+    assert_eq!(withdrawn2, 1000);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 1200);
+    assert_eq!(state.status, StreamStatus::Active);
+}
+
+#[test]
 #[should_panic]
 fn test_update_rate_per_second_unauthorized_caller() {
     let ctx = TestContext::setup_strict();
