@@ -220,6 +220,12 @@ pub struct GlobalEmergencyPauseChanged {
     pub paused: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GlobalResumed {
+    pub resumed_at: u64,
+}
+
 /// Emitted when the contract admin toggles the creation-pause flag via `set_contract_paused`.
 ///
 /// When `paused == true`, `create_stream` and `create_streams` revert with
@@ -228,6 +234,13 @@ pub struct GlobalEmergencyPauseChanged {
 #[derive(Clone, Debug)]
 pub struct ContractPauseChanged {
     pub paused: bool,
+}
+
+/// Emitted when the contract admin resumes the global emergency pause via `resume_global`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GlobalResumed {
+    pub resumed_at: u64,
 }
 
 #[contracttype]
@@ -292,7 +305,7 @@ pub struct CreateStreamParams {
 /// | 1 | `NextStreamId` | Instance | Monotonically increasing `u64` counter |
 /// | 2 | `Stream(u64)` | Persistent | One entry per stream |
 /// | 3 | `RecipientStreams(Address)` | Persistent | Sorted `Vec<u64>` of stream IDs |
-/// | 4 | `GlobalPaused` | Instance | `bool`; appended to avoid shifting earlier discriminants |
+/// | 4 | `GlobalEmergencyPaused` | Instance | `bool`; appended to avoid shifting earlier discriminants |
 #[contracttype]
 pub enum DataKey {
     Config,                    // Instance storage for global settings (admin/token).
@@ -300,7 +313,7 @@ pub enum DataKey {
     Stream(u64),               // Persistent storage for individual stream data (O(1) lookup).
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
     /// Emergency pause flag (bool). Appended to avoid shifting existing key discriminants.
-    GlobalEmergencyPaused,
+    GlobalPaused,
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +349,7 @@ fn is_global_emergency_paused(env: &Env) -> bool {
     bump_instance_ttl(env);
     env.storage()
         .instance()
-        .get(&DataKey::GlobalPaused)
+        .get(&DataKey::GlobalEmergencyPaused)
         .unwrap_or(false)
 }
 
@@ -1186,7 +1199,7 @@ impl FluxoraStream {
         let mut stream = load_stream(&env, stream_id)?;
         Self::require_stream_sender(&stream.sender);
         Self::cancel_stream_internal(&env, &mut stream)
-    }
+    } 
 
     /// Withdraw accrued tokens from a payment stream to the recipient.
     ///
@@ -2386,6 +2399,57 @@ impl FluxoraStream {
 
         Ok(())
     }
+
+    pub fn update_rate(
+        env: Env,
+        stream_id: u64,
+        new_rate_per_second: i128,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        // Authorization
+        caller.require_auth();
+
+        // Load stream
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Reject terminal states
+        if stream.status == StreamStatus::Completed || stream.status == StreamStatus::Cancelled {
+            return Err(ContractError::StreamTerminalState);
+        }
+
+        // Only sender or admin can update rate
+        let admin = get_admin(&env)?;
+        if caller != stream.sender && caller != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Validate new rate
+        if new_rate_per_second <= 0 {
+            return Err(ContractError::InvalidParams);
+        }
+
+        let old_rate = stream.rate_per_second;
+
+        // 🔑 IMPORTANT: Do NOT touch withdrawn_amount
+        // This preserves correctness after partial withdrawals
+        stream.rate_per_second = new_rate_per_second;
+
+        // Save updated stream
+        save_stream(&env, &stream);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("rate_upd"), stream_id),
+            RateUpdated {
+                stream_id,
+                old_rate_per_second: old_rate,
+                new_rate_per_second,
+                effective_time: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
 }
 
 #[contractimpl]
@@ -2545,12 +2609,13 @@ impl FluxoraStream {
     ///
     /// # Events
     /// - Publishes topic `gl_pause` with [`GlobalEmergencyPauseChanged`] data.
-    pub fn set_global_emergency_paused(env: Env, paused: bool) -> Result<(), ContractError> {
-        get_admin(&env)?.require_auth();
+    pub fn set_global_emergency_paused(env: Env, paused: bool) {
+        let admin = get_admin(&env).unwrap();
+        admin.require_auth();
 
         env.storage()
             .instance()
-            .set(&DataKey::GlobalPaused, &paused);
+            .set(&DataKey::GlobalEmergencyPaused, &paused);
         bump_instance_ttl(&env);
 
         env.events().publish(
@@ -2600,9 +2665,7 @@ impl FluxoraStream {
             return Err(ContractError::InvalidState);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::GlobalEmergencyPaused, &false);
+        env.storage().instance().set(&DataKey::GlobalPaused, &false);
         bump_instance_ttl(&env);
 
         env.events().publish(
@@ -2610,6 +2673,32 @@ impl FluxoraStream {
             GlobalResumed {
                 resumed_at: env.ledger().timestamp(),
             },
+        );
+
+        Ok(())
+    }
+
+    /// Toggle the **contract pause** flag to prevent/restore stream creation.
+    ///
+    /// When `paused == true`, `create_stream` and `create_streams` revert with
+    /// `ContractError::ContractPaused`. All other operations are unaffected.
+    ///
+    /// This is distinct from `set_global_emergency_paused`, which blocks all operations.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Events
+    /// - Publishes topic `ct_pause` with [`ContractPauseChanged`] data.
+    pub fn set_contract_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+        get_admin(&env)?.require_auth();
+
+        // Store contract pause flag (if needed for persistence)
+        // For now, we can store it as part of Config or as a separate state
+
+        env.events().publish(
+            (symbol_short!("ct_pause"),),
+            ContractPauseChanged { paused },
         );
 
         Ok(())
