@@ -981,7 +981,7 @@ fn adversarial_set_admin_stranger_rejected_config_unchanged() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "set_admin",
-            args: (&new_admin,).into_val(&ctx.env),
+            args: (new_admin.clone(),).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -1015,7 +1015,7 @@ fn adversarial_set_admin_sender_rejected_config_unchanged() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "set_admin",
-            args: (&new_admin,).into_val(&ctx.env),
+            args: (new_admin.clone(),).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -1040,7 +1040,7 @@ fn adversarial_set_admin_old_admin_revoked_after_rotation() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "set_admin",
-            args: (&new_admin,).into_val(&ctx.env),
+            args: (new_admin.clone(),).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -1054,7 +1054,7 @@ fn adversarial_set_admin_old_admin_revoked_after_rotation() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "set_admin",
-            args: (&another,).into_val(&ctx.env),
+            args: (another.clone(),).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -1374,12 +1374,13 @@ fn adversarial_extend_end_time_recipient_rejected() {
                 &0u64,
                 &0u64,
                 &1000u64,
+>>>>>>> upstream/main
             )
                 .into_val(&ctx.env),
             sub_invokes: &[MockAuthInvoke {
                 contract: &ctx.token_id,
                 fn_name: "transfer",
-                args: (&ctx.sender, &ctx.contract_id, &2000_i128).into_val(&ctx.env),
+                args: (&ctx.sender, &ctx.contract_id, 2000_i128).into_val(&ctx.env),
                 sub_invokes: &[],
             }],
         },
@@ -1401,7 +1402,7 @@ fn adversarial_extend_end_time_recipient_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "extend_stream_end_time",
-            args: (stream_id, &2000u64).into_val(&ctx.env),
+            args: (stream_id, 2000u64).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
