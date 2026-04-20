@@ -107,16 +107,18 @@
           "v0": {
             "topics": [
               {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "set_global_emergency_paused"
+                "symbol": "log"
               }
             ],
             "data": {
-              "error": {
-                "contract": 2
-              }
+              "vec": [
+                {
+                  "string": "caught panic 'called `Result::unwrap()` on an `Err` value: InvalidState' from contract function 'Symbol(obj#5)'"
+                },
+                {
+                  "bool": true
+                }
+              ]
             }
           }
         }
@@ -136,12 +138,12 @@
               },
               {
                 "error": {
-                  "contract": 2
+                  "wasm_vm": "invalid_action"
                 }
               }
             ],
             "data": {
-              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
+              "string": "caught error from function"
             }
           }
         }
@@ -161,7 +163,7 @@
               },
               {
                 "error": {
-                  "contract": 2
+                  "wasm_vm": "invalid_action"
                 }
               }
             ],
@@ -200,7 +202,7 @@
               },
               {
                 "error": {
-                  "contract": 2
+                  "wasm_vm": "invalid_action"
                 }
               }
             ],

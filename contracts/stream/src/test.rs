@@ -10527,32 +10527,15 @@ fn test_update_rate_per_second_preserves_other_fields() {
 fn test_update_rate_per_second_with_overflow_protection() {
     let ctx = TestContext::setup();
 
-    // Create stream with max-ish values.
+    // Create a normal stream (no huge minting required).
     ctx.env.ledger().set_timestamp(0);
-    let max_rate = i128::MAX / 1000; // Safe rate for 1000 second duration.
-    let deposit = max_rate * 1000;
+    let stream_id = ctx.create_default_stream();
 
-    // Ensure sender has enough balance to fund the huge deposit.
-    ctx.sac.mint(&ctx.sender, &deposit);
-
-    let stream_id = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &deposit,
-        &max_rate,
-        &0u64,
-        &0u64,
-        &1_000u64,
-    );
-
-    // Attempt to update to a rate that would overflow.
+    // Updating to an extreme rate should overflow `new_rate * duration` and be rejected.
     let result = ctx
         .client()
-        .try_update_rate_per_second(&stream_id, &(max_rate + 1));
-    assert!(
-        result.is_err(),
-        "Should fail due to overflow or insufficient deposit"
-    );
+        .try_update_rate_per_second(&stream_id, &i128::MAX);
+    assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
 }
 
 #[test]
