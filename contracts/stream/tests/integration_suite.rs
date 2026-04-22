@@ -3477,3 +3477,207 @@ fn shorten_end_time_one_second_future_accepted() {
         .try_shorten_stream_end_time(&stream_id, &501u64);
     assert!(result.is_ok(), "new_end_time = now+1 must be accepted");
 }
+
+// ---------------------------------------------------------------------------
+// Protocol Pause/Resume Integration Tests (#399)
+// ---------------------------------------------------------------------------
+
+/// Full pause/resume cycle: create, pause (creation blocked), resume, create again.
+#[test]
+fn integration_test_full_pause_resume_cycle() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // 1. Create a stream (should succeed)
+    let stream_id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+    assert_eq!(stream_id1, 0, "First stream should have ID 0");
+
+    // 2. Pause via admin
+    ctx.client().pause_protocol(
+        &ctx.admin,
+        &Some(soroban_sdk::String::from_str(&ctx.env, "integration test")),
+    );
+
+    // 3. Verify is_paused() returns true
+    assert!(ctx.client().is_paused(), "is_paused should return true after pause");
+
+    // 4. Attempt to create another stream (should fail with ContractPaused)
+    let result = ctx.client().try_create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "Stream creation should be blocked when paused"
+    );
+
+    // 5. Resume via admin
+    ctx.client().resume_protocol(&ctx.admin);
+
+    // 6. Verify is_paused() returns false
+    assert!(!ctx.client().is_paused(), "is_paused should return false after resume");
+
+    // 7. Create another stream (should succeed again)
+    let stream_id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+    assert_eq!(stream_id2, 1, "Second stream should have ID 1");
+}
+
+/// Pause event appears in the ledger event log.
+#[test]
+fn integration_test_pause_event_emitted_on_ledger() {
+    use soroban_sdk::{testutils::Events, Symbol, TryFromVal};
+    use fluxora_stream::{ProtocolPaused, ProtocolResumed};
+
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(1234);
+
+    // Pause the protocol
+    let reason = soroban_sdk::String::from_str(&ctx.env, "ledger event test");
+    ctx.client().pause_protocol(&ctx.admin, &Some(reason.clone()));
+
+    // Query the ledger events
+    let events = ctx.env.events().all();
+    let pause_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::try_from_val(&ctx.env, &topics.get(0).unwrap())
+                    == Ok(Symbol::new(&ctx.env, "pr_pause"))
+        })
+        .expect("ProtocolPaused event should appear in ledger");
+
+    // Verify the event data
+    let payload = ProtocolPaused::try_from_val(&ctx.env, &pause_event.2)
+        .expect("Payload should decode as ProtocolPaused");
+    assert_eq!(payload.reason, reason);
+    assert_eq!(payload.paused_at, 1234);
+
+    // Clear events and resume
+    let _ = ctx.env.events().all(); // Consume
+    ctx.env.ledger().set_timestamp(5678);
+    ctx.client().resume_protocol(&ctx.admin);
+
+    // Verify resume event
+    let events = ctx.env.events().all();
+    let resume_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::try_from_val(&ctx.env, &topics.get(0).unwrap())
+                    == Ok(Symbol::new(&ctx.env, "pr_resume"))
+        })
+        .expect("ProtocolResumed event should appear in ledger");
+
+    let payload = ProtocolResumed::try_from_val(&ctx.env, &resume_event.2)
+        .expect("Payload should decode as ProtocolResumed");
+    assert_eq!(payload.resumed_at, 5678);
+}
+
+/// Non-admin cannot pause the protocol.
+#[test]
+fn integration_test_non_admin_cannot_pause() {
+    let ctx = TestContext::setup();
+    let non_admin = Address::generate(&ctx.env);
+
+    // Attempt pause from non-admin wallet
+    let result = ctx.client().try_pause_protocol(
+        &non_admin,
+        &Some(soroban_sdk::String::from_str(&ctx.env, "unauthorized")),
+    );
+
+    // Should fail with Unauthorized
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::Unauthorized)),
+        "Non-admin pause should fail with Unauthorized"
+    );
+
+    // Verify protocol is NOT paused
+    assert!(!ctx.client().is_paused(), "Protocol should not be paused after failed attempt");
+}
+
+/// Non-admin cannot resume the protocol.
+#[test]
+fn integration_test_non_admin_cannot_resume() {
+    let ctx = TestContext::setup();
+    let non_admin = Address::generate(&ctx.env);
+
+    // First pause as admin
+    ctx.client().pause_protocol(
+        &ctx.admin,
+        &Some(soroban_sdk::String::from_str(&ctx.env, "test")),
+    );
+    assert!(ctx.client().is_paused());
+
+    // Attempt resume as non-admin
+    let result = ctx.client().try_resume_protocol(&non_admin);
+
+    // Should fail with Unauthorized
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::Unauthorized)),
+        "Non-admin resume should fail with Unauthorized"
+    );
+
+    // Verify protocol is STILL paused
+    assert!(ctx.client().is_paused(), "Protocol should remain paused after failed resume");
+}
+
+/// get_pause_info returns correct data during pause cycle.
+#[test]
+fn integration_test_get_pause_info_consistency() {
+    use fluxora_stream::PauseInfo;
+
+    let ctx = TestContext::setup();
+
+    // Before pause: all None/False
+    let info_before: PauseInfo = ctx.client().get_pause_info();
+    assert!(!info_before.is_paused);
+    assert!(info_before.reason.is_none());
+    assert!(info_before.paused_at.is_none());
+    assert!(info_before.paused_by.is_none());
+
+    // Pause with reason
+    ctx.env.ledger().set_timestamp(9999);
+    let reason = soroban_sdk::String::from_str(&ctx.env, "info test");
+    ctx.client().pause_protocol(&ctx.admin, &Some(reason.clone()));
+
+    // During pause: all fields populated
+    let info_during: PauseInfo = ctx.client().get_pause_info();
+    assert!(info_during.is_paused);
+    assert_eq!(info_during.reason, Some(reason));
+    assert_eq!(info_during.paused_at, Some(9999));
+    assert_eq!(info_during.paused_by, Some(ctx.admin.clone()));
+
+    // Resume
+    ctx.client().resume_protocol(&ctx.admin);
+
+    // After resume: cleared
+    let info_after: PauseInfo = ctx.client().get_pause_info();
+    assert!(!info_after.is_paused);
+    assert!(info_after.reason.is_none());
+    assert!(info_after.paused_at.is_none());
+    assert!(info_after.paused_by.is_none());
+}
