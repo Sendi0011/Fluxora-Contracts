@@ -10,7 +10,7 @@ Onboarding and integration reference for developers and auditors. Describes stre
 
 When changing the contract:
 
-- Update this doc if you change lifecycle, access control, events, or panic messages
+- Update this doc if you change lifecycle, access control, events, or error semantics
 - Update `protocol-narrative-code-alignment.md` to reflect changes
 - Run `cargo test -p fluxora_stream` before committing
 - Update snapshot tests if externally visible behavior changes
@@ -301,7 +301,7 @@ The same sufficiency check is enforced when extending a stream's `end_time`:
 deposit_amount >= rate_per_second * (new_end_time - start_time)
 ```
 
-If the existing deposit does not cover the extended duration, `extend_stream_end_time` panics with `"deposit_amount must cover total streamable amount for extended schedule"` and no state changes occur. Use `top_up_stream` first to increase the deposit, then extend.
+If the existing deposit does not cover the extended duration, `extend_stream_end_time` returns `ContractError::InsufficientDeposit` and no state changes occur. Use `top_up_stream` first to increase the deposit, then extend.
 
 ### Shorten `end_time` Semantics
 
@@ -416,7 +416,7 @@ Treasury policy note: if an application wants to restrict who may fund streams, 
 
 `batch_withdraw` processes each stream ID in order. A stream with status `Completed` **does not panic** — it contributes a zero-amount result (`BatchWithdrawResult { stream_id, amount: 0 }`) and is skipped silently. No token transfer and no event are emitted for that entry. This allows callers to pass a mixed list of active and already-completed streams without pre-filtering.
 
-A `Paused` stream **does** panic and reverts the entire batch.
+A `Paused` stream **does** return `ContractError::InvalidState` and reverts the entire batch.
 
 ### One-Shot Init and Immutable Bootstrap
 
@@ -424,7 +424,7 @@ A `Paused` stream **does** panic and reverts the entire batch.
 
 - One-shot: first successful call writes `Config { token, admin }` and `NextStreamId = 0`.
 - Auth boundary: the supplied `admin` address must authorize the call.
-- Re-init failure: any second call panics with `"already initialised"`.
+- Re-init failure: any second call returns `ContractError::AlreadyInitialised`.
 - Failure atomicity: failed auth or re-init leaves bootstrap storage unchanged.
 - Immutability boundary: `token` is immutable after init; `admin` can rotate only via `set_admin` with current-admin auth.
 
@@ -488,7 +488,7 @@ These guarantees are limited to `create_streams` creation semantics. They do not
 
 - Auth boundary: only the stream `recipient` can authorize `batch_withdraw`.
 - Non-recipient calls fail before transfer/state/event side effects.
-- Uniqueness check: `stream_ids` must not contain duplicates; duplicates panic and revert the entire batch.
+- Uniqueness check: `stream_ids` must not contain duplicates; duplicates return `ContractError::DuplicateStreamId` and revert the entire batch.
 - Completed streams: contribute a zero-amount result and are skipped silently (no error, no event).
 - Active/Paused streams: processed normally; `Paused` streams panic and revert the entire batch.
 - Event ordering on active final drain: `withdrew` is emitted before `completed`.

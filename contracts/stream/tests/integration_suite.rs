@@ -3477,3 +3477,91 @@ fn shorten_end_time_one_second_future_accepted() {
         .try_shorten_stream_end_time(&stream_id, &501u64);
     assert!(result.is_ok(), "new_end_time = now+1 must be accepted");
 }
+
+// ---------------------------------------------------------------------------
+// Structured error integration tests (#442)
+//
+// Verify that previously-panicking input-error paths now return structured
+// ContractError variants so clients can handle them programmatically.
+// ---------------------------------------------------------------------------
+
+/// batch_withdraw with duplicate stream IDs returns DuplicateStreamId (not panic).
+#[test]
+fn integration_batch_withdraw_duplicate_ids_returns_structured_error() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+
+    let ids = soroban_sdk::vec![&ctx.env, stream_id, stream_id];
+    let result = ctx.client().try_batch_withdraw(&ctx.recipient, &ids);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::DuplicateStreamId)),
+        "duplicate IDs must return DuplicateStreamId"
+    );
+
+    // No state mutation occurred
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 0);
+}
+
+/// Globally paused contract returns ContractPaused from withdraw (not panic).
+#[test]
+fn integration_globally_paused_withdraw_returns_structured_error() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+    ctx.client().set_global_emergency_paused(&true);
+
+    let result = ctx.client().try_withdraw(&stream_id);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "withdraw while globally paused must return ContractPaused"
+    );
+}
+
+/// Globally paused contract returns ContractPaused from update_rate_per_second.
+#[test]
+fn integration_globally_paused_update_rate_returns_structured_error() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.client().set_global_emergency_paused(&true);
+
+    let result = ctx.client().try_update_rate_per_second(&stream_id, &2_i128);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "update_rate_per_second while globally paused must return ContractPaused"
+    );
+}

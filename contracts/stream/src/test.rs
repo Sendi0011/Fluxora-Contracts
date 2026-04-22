@@ -17329,3 +17329,180 @@ mod recipient_index_stress {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured error tests: panic → ContractError refactor (#442)
+//
+// These tests verify that all previously-panicking input-error paths now
+// return the appropriate ContractError variant instead of aborting the host.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod structured_error_tests {
+    use super::*;
+
+    // ── batch_withdraw: duplicate stream IDs ────────────────────────────────
+
+    /// Duplicate stream IDs in batch_withdraw must return DuplicateStreamId,
+    /// not panic. The entire batch must be reverted atomically.
+    #[test]
+    fn batch_withdraw_duplicate_stream_ids_returns_structured_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        let stream_id = client.create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+
+        ctx.env.ledger().set_timestamp(500);
+
+        // Pass the same stream_id twice — must return DuplicateStreamId
+        let ids = soroban_sdk::vec![&ctx.env, stream_id, stream_id];
+        let result = client.try_batch_withdraw(&ctx.recipient, &ids);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::DuplicateStreamId)),
+            "duplicate stream IDs must return DuplicateStreamId, not panic"
+        );
+
+        // State must be unchanged (no withdrawal occurred)
+        let state = client.get_stream_state(&stream_id);
+        assert_eq!(state.withdrawn_amount, 0);
+    }
+
+    // ── create_streams: batch deposit overflow ───────────────────────────────
+
+    /// When the sum of deposit_amounts in create_streams overflows i128,
+    /// the call must return ArithmeticOverflow, not panic.
+    #[test]
+    fn create_streams_batch_deposit_overflow_returns_structured_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        // Two entries whose deposits sum to > i128::MAX
+        let half = i128::MAX / 2 + 1;
+        let params = soroban_sdk::vec![
+            &ctx.env,
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: half,
+                rate_per_second: 1_i128,
+                start_time: 0u64,
+                cliff_time: 0u64,
+                end_time: half as u64,
+            },
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: half,
+                rate_per_second: 1_i128,
+                start_time: 0u64,
+                cliff_time: 0u64,
+                end_time: half as u64,
+            },
+        ];
+
+        let result = client.try_create_streams(&ctx.sender, &params);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ArithmeticOverflow)),
+            "batch deposit overflow must return ArithmeticOverflow, not panic"
+        );
+    }
+
+    // ── update_rate_per_second: rate × duration overflow ────────────────────
+
+    /// When new_rate_per_second × duration overflows i128,
+    /// update_rate_per_second must return ArithmeticOverflow, not panic.
+    #[test]
+    fn update_rate_overflow_returns_structured_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        // Create a stream with a very large end_time so duration is huge
+        let large_end: u64 = u64::MAX / 2;
+        // deposit must be >= rate * duration; use i128::MAX as deposit
+        // We need to mint enough tokens first
+        ctx.sac.mint(&ctx.sender, &i128::MAX);
+
+        let stream_id = client.create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &i128::MAX,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &large_end,
+        );
+
+        // new_rate * large_end overflows i128
+        let overflow_rate = i128::MAX / (large_end as i128) + 2;
+        let result = client.try_update_rate_per_second(&stream_id, &overflow_rate);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ArithmeticOverflow)),
+            "rate × duration overflow must return ArithmeticOverflow, not panic"
+        );
+    }
+
+    // ── require_not_globally_paused: returns ContractError ──────────────────
+
+    /// When the contract is globally paused, withdraw must return ContractPaused
+    /// as a structured error, not panic.
+    #[test]
+    fn globally_paused_withdraw_returns_contract_paused_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        let stream_id = client.create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+
+        ctx.env.ledger().set_timestamp(500);
+        client.set_global_emergency_paused(&true);
+
+        let result = client.try_withdraw(&stream_id);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ContractPaused)),
+            "withdraw while globally paused must return ContractPaused, not panic"
+        );
+    }
+
+    /// When the contract is globally paused, cancel_stream must return ContractPaused.
+    #[test]
+    fn globally_paused_cancel_returns_contract_paused_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        let stream_id = client.create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+
+        client.set_global_emergency_paused(&true);
+
+        let result = client.try_cancel_stream(&stream_id);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ContractPaused)),
+            "cancel_stream while globally paused must return ContractPaused, not panic"
+        );
+    }
+}

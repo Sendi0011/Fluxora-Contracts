@@ -5,7 +5,7 @@ mod accrual;
 mod checksum;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Env,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
 };
 
 // ---------------------------------------------------------------------------
@@ -120,6 +120,8 @@ pub enum ContractError {
     StreamNotPaused = 12,
     /// Stream is in a terminal state (Completed or Cancelled) and cannot be modified.
     StreamTerminalState = 13,
+    /// Duplicate stream IDs were supplied to a batch operation.
+    DuplicateStreamId = 14,
 }
 
 #[contracttype]
@@ -354,12 +356,13 @@ fn is_creation_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
-/// Panics when [`is_global_emergency_paused`] is true. Admin/admin-override entrypoints
-/// must not call this so operators can still intervene.
-fn require_not_globally_paused(env: &Env) {
+/// Returns `Err(ContractError::ContractPaused)` when [`is_global_emergency_paused`] is true.
+/// Admin/admin-override entrypoints must not call this so operators can still intervene.
+fn require_not_globally_paused(env: &Env) -> Result<(), ContractError> {
     if is_global_emergency_paused(env) {
-        panic_with_error!(env, ContractError::ContractPaused);
+        return Err(ContractError::ContractPaused);
     }
+    Ok(())
 }
 
 fn read_stream_count(env: &Env) -> u64 {
@@ -892,8 +895,6 @@ impl FluxoraStream {
     /// - `Unauthorized` (7): Sender signature is missing.
     ///
     /// # Panics
-    /// - If any entry violates `create_stream` validation rules
-    /// - If total batch deposit overflows `i128` (`"overflow calculating total batch deposit"`)
     /// - If token transfer fails due to sender balance/allowance constraints
     ///
     /// # Security Notes
@@ -1010,9 +1011,7 @@ impl FluxoraStream {
             )?;
             total_deposit = total_deposit
                 .checked_add(params.deposit_amount)
-                .unwrap_or_else(|| {
-                    panic_with_error!(env, ContractError::ArithmeticOverflow);
-                });
+                .ok_or(ContractError::ArithmeticOverflow)?;
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas.
@@ -1201,7 +1200,7 @@ impl FluxoraStream {
     /// - Cancel at 100% completion → sender gets 0% refund, recipient can withdraw 100%
     /// - Cancel before cliff → sender gets 100% refund (no accrual before cliff)
     pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
         Self::require_stream_sender(&stream.sender);
         Self::cancel_stream_internal(&env, &mut stream)
@@ -1264,7 +1263,7 @@ impl FluxoraStream {
     /// - At t=800: withdraw() returns 500 tokens (800 - 300 already withdrawn)
     /// - At t=1000: withdraw() returns 200 tokens, status → Completed
     pub fn withdraw(env: Env, stream_id: u64) -> Result<i128, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Enforce recipient-only authorization
@@ -1383,7 +1382,7 @@ impl FluxoraStream {
         stream_id: u64,
         destination: Address,
     ) -> Result<i128, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Enforce recipient-only authorization for source of funds
@@ -1450,12 +1449,12 @@ impl FluxoraStream {
     /// The caller must be the recipient of every stream in `stream_ids`. Each stream
     /// is processed in order: same validation and accounting as `withdraw`. Events
     /// are emitted per stream. The operation is atomic: if any stream fails
-    /// (e.g. not found, not recipient's, or paused), the entire call panics
+    /// (e.g. not found, not recipient's, or paused), the entire call returns an error
     /// and no state changes or transfers occur.
     ///
     /// # Parameters
     /// - `recipient`: Address that must authorize and must be the recipient of all streams
-    /// - `stream_ids`: Stream IDs to withdraw from (**must be unique**; duplicates panic)
+    /// - `stream_ids`: Stream IDs to withdraw from (**must be unique**; duplicates return `DuplicateStreamId`)
     ///
     /// # Returns
     /// - `Vec<BatchWithdrawResult>`: Per-stream `(stream_id, amount)` for each entry.
@@ -1474,7 +1473,7 @@ impl FluxoraStream {
     /// - No errors are raised (empty batch is valid)
     ///
     /// # Completed streams
-    /// A `Completed` stream in the batch does **not** panic. It contributes a zero-amount
+    /// A `Completed` stream in the batch does **not** error. It contributes a zero-amount
     /// result and is skipped silently. This allows callers to pass a mixed list of active
     /// and already-completed streams without pre-filtering.
     ///
@@ -1487,15 +1486,15 @@ impl FluxoraStream {
     /// - Requires authorization from `recipient` once for the entire batch
     ///
     /// # Atomicity
-    /// - All streams are processed in order. Any panic (stream not found, wrong recipient,
-    ///   paused) reverts the whole transaction.
+    /// - All streams are processed in order. Any error (stream not found, wrong recipient,
+    ///   paused, or duplicate IDs) reverts the whole transaction.
     /// - Completed streams are not an error: they produce amount `0` and no events.
     pub fn batch_withdraw(
         env: Env,
         recipient: Address,
         stream_ids: soroban_sdk::Vec<u64>,
     ) -> Result<soroban_sdk::Vec<BatchWithdrawResult>, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         recipient.require_auth();
 
         let n = stream_ids.len();
@@ -1503,10 +1502,9 @@ impl FluxoraStream {
             let a = stream_ids.get(i).unwrap();
             let mut j = i + 1;
             while j < n {
-                assert!(
-                    stream_ids.get(j).unwrap() != a,
-                    "batch_withdraw stream_ids must be unique"
-                );
+                if stream_ids.get(j).unwrap() == a {
+                    return Err(ContractError::DuplicateStreamId);
+                }
                 j += 1;
             }
         }
@@ -1900,7 +1898,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_rate_per_second: i128,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can update the rate.
@@ -1925,9 +1923,7 @@ impl FluxoraStream {
         let duration = (stream.end_time - stream.start_time) as i128;
         let total_streamable = new_rate_per_second
             .checked_mul(duration)
-            .unwrap_or_else(|| {
-                panic_with_error!(env, ContractError::ArithmeticOverflow);
-            });
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         if stream.deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -1983,7 +1979,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_end_time: u64,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can modify the schedule.
@@ -2008,9 +2004,7 @@ impl FluxoraStream {
         let new_max_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .unwrap_or_else(|| {
-                panic_with_error!(env, ContractError::ArithmeticOverflow);
-            });
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         // Deposit must still be sufficient to cover the shortened schedule (by construction
         // this should hold given the original validation, but we keep an explicit assert).
@@ -2074,7 +2068,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_end_time: u64,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can modify the schedule.
@@ -2099,9 +2093,7 @@ impl FluxoraStream {
         let new_total_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .unwrap_or_else(|| {
-                panic_with_error!(env, ContractError::ArithmeticOverflow);
-            });
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         if new_total_streamable > stream.deposit_amount {
             return Err(ContractError::InsufficientDeposit);
