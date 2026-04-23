@@ -4,9 +4,7 @@ mod accrual;
 #[cfg(test)]
 mod checksum;
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 // ---------------------------------------------------------------------------
 // TTL constants
@@ -419,6 +417,8 @@ pub enum DataKey {
     GlobalPauseTimestamp,
     /// Protocol pause admin (Address). The admin address that activated the pause.
     GlobalPauseAdmin,
+    /// Auto-claim destination per stream (Address). Set by recipient to redirect withdrawals.
+    AutoClaimDestination(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -490,23 +490,17 @@ fn require_not_paused(env: &Env) -> Result<(), ContractError> {
 
 /// Get the stored pause reason, if any.
 fn get_pause_reason(env: &Env) -> Option<soroban_sdk::String> {
-    env.storage()
-        .instance()
-        .get(&DataKey::GlobalPauseReason)
+    env.storage().instance().get(&DataKey::GlobalPauseReason)
 }
 
 /// Get the stored pause timestamp, if any.
 fn get_pause_timestamp(env: &Env) -> Option<u64> {
-    env.storage()
-        .instance()
-        .get(&DataKey::GlobalPauseTimestamp)
+    env.storage().instance().get(&DataKey::GlobalPauseTimestamp)
 }
 
 /// Get the stored pause admin address, if any.
 fn get_pause_admin(env: &Env) -> Option<Address> {
-    env.storage()
-        .instance()
-        .get(&DataKey::GlobalPauseAdmin)
+    env.storage().instance().get(&DataKey::GlobalPauseAdmin)
 }
 
 fn read_stream_count(env: &Env) -> u64 {
@@ -3636,7 +3630,9 @@ impl FluxoraStream {
             .instance()
             .set(&DataKey::GlobalEmergencyPaused, &false);
         env.storage().instance().remove(&DataKey::GlobalPauseReason);
-        env.storage().instance().remove(&DataKey::GlobalPauseTimestamp);
+        env.storage()
+            .instance()
+            .remove(&DataKey::GlobalPauseTimestamp);
         env.storage().instance().remove(&DataKey::GlobalPauseAdmin);
 
         bump_instance_ttl(&env);
@@ -3695,3 +3691,5 @@ impl FluxoraStream {
 mod test;
 #[cfg(test)]
 mod test_issue_39;
+#[cfg(test)]
+mod test_withdrawable_props;
