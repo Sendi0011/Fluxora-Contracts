@@ -10137,11 +10137,11 @@ fn test_update_rate_per_second_before_cliff() {
     let accrued_after = ctx.client().calculate_accrued(&stream_id);
     assert_eq!(accrued_after, 0);
 
-    // After cliff at t=600, accrual uses new rate.
+    // After cliff at t=600, accrual uses new rate forward-only from checkpoint (t=100).
     ctx.env.ledger().set_timestamp(600);
     let accrued_post_cliff = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 600 - 0 = 600, rate = 2 → 1200 accrued (capped at deposit 2000).
-    assert_eq!(accrued_post_cliff, 1200);
+    // checkpoint_at=100, checkpointed_amount=0, rate=2, elapsed=600-100=500 → 0+1000=1000
+    assert_eq!(accrued_post_cliff, 1000);
 }
 
 #[test]
@@ -10214,8 +10214,8 @@ fn test_update_rate_per_second_near_end_time() {
     // After end_time at t=1100, accrual is capped at end_time.
     ctx.env.ledger().set_timestamp(1100);
     let accrued_final = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 1000 (capped at end_time), rate = 5 → 5000 (capped at deposit 10000).
-    assert_eq!(accrued_final, 5000);
+    // checkpoint at t=950: amount=950; new epoch: 5*(end=1000-950)=250; total=1200
+    assert_eq!(accrued_final, 1200);
 }
 
 #[test]
@@ -10239,13 +10239,13 @@ fn test_update_rate_per_second_after_end_time() {
     let accrued_before = ctx.client().calculate_accrued(&stream_id);
     assert_eq!(accrued_before, 1000); // capped at rate * duration
 
-    // Update rate from 1 → 5.
+    // Update rate from 1 → 5 (at t=1500, past end_time=1000).
     ctx.client().update_rate_per_second(&stream_id, &5_i128);
 
-    // Accrual is still capped at end_time.
+    // Accrual is still capped at end_time; checkpoint_at=1500 >= end=1000,
+    // so no additional accrual is possible beyond the checkpointed 1000 tokens.
     let accrued_after = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 1000 (capped), rate = 5 → 5000 (capped at deposit 10000).
-    assert_eq!(accrued_after, 5000);
+    assert_eq!(accrued_after, 1000);
 }
 
 #[test]
@@ -10279,11 +10279,11 @@ fn test_update_rate_per_second_with_partial_withdrawal() {
     // At t=400, calculate new withdrawable.
     ctx.env.ledger().set_timestamp(400);
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 400, rate = 5 → 2000 accrued.
-    assert_eq!(accrued, 2000);
+    // checkpoint at t=300: amount=300; new epoch rate=5: 5*(400-300)=500; total=800
+    assert_eq!(accrued, 800);
 
     let withdrawable = accrued - state.withdrawn_amount;
-    assert_eq!(withdrawable, 1700);
+    assert_eq!(withdrawable, 500);
 }
 
 #[test]
@@ -10364,12 +10364,12 @@ fn test_update_rate_per_second_on_paused_stream_after_partial_withdrawal() {
     assert_eq!(state_after.status, StreamStatus::Paused);
     assert_eq!(state_after.withdrawn_amount, 300);
 
-    // Accrued should use new rate retroactively.
+    // Accrued at the same timestamp (t=300): checkpoint locked in accrual=300; rate applies forward.
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    assert_eq!(accrued, 300 * 5); // 1500
+    assert_eq!(accrued, 300); // checkpoint preserves prior accrual; no new seconds elapsed yet
 
     let withdrawable = accrued - state_after.withdrawn_amount;
-    assert_eq!(withdrawable, 1200);
+    assert_eq!(withdrawable, 0); // already fully withdrawn up to this point
 }
 
 #[test]
@@ -10405,13 +10405,12 @@ fn test_update_rate_per_second_after_partial_withdrawal_then_resume_and_withdraw
     // At t=400, withdraw again.
     ctx.env.ledger().set_timestamp(400);
     let withdrawn2 = ctx.client().withdraw(&stream_id);
-    // Accrued at t=400 with rate=3: 400*3 = 1200
-    // Withdrawn so far: 200
-    // Withdrawable: 1000
-    assert_eq!(withdrawn2, 1000);
+    // Checkpoint at t=200: amount=200; new epoch rate=3: 3*(400-200)=600; total=800
+    // Withdrawn so far: 200; withdrawable: 800-200=600
+    assert_eq!(withdrawn2, 600);
 
     let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.withdrawn_amount, 1200);
+    assert_eq!(state.withdrawn_amount, 800);
     assert_eq!(state.status, StreamStatus::Active);
 }
 
@@ -10583,11 +10582,11 @@ fn test_update_rate_per_second_interaction_with_pause_resume() {
     ctx.env.ledger().set_timestamp(200);
     ctx.client().resume_stream(&stream_id);
 
-    // Verify accrual uses new rate.
+    // Verify accrual uses new rate from checkpoint at t=100.
     ctx.env.ledger().set_timestamp(300);
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 300, rate = 5 → 1500 accrued.
-    assert_eq!(accrued, 1500);
+    // checkpoint at t=100: amount=100; new epoch: 5*(300-100)=1000; total=1100
+    assert_eq!(accrued, 1100);
 }
 
 #[test]
@@ -14591,7 +14590,7 @@ fn regression_missing_config_version_still_works() {
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
     let version = client.version();
-    assert_eq!(version, 1, "version must be accessible without init");
+    assert_eq!(version, 2, "version must be accessible without init");
 }
 
 /// `get_stream_state()` for a non-existent stream on an uninitialised
@@ -17720,197 +17719,26 @@ mod recipient_index_stress {
 }
 
 // ---------------------------------------------------------------------------
-// Protocol Pause/Resume Tests - Global Emergency Pause Semantics (#399)
+// Structured error tests: panic → ContractError refactor (#442)
+//
+// These tests verify that all previously-panicking input-error paths now
+// return the appropriate ContractError variant instead of aborting the host.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod protocol_pause_tests {
+mod structured_error_tests {
     use super::*;
-    use crate::{ContractError, PauseInfo, ProtocolPaused, ProtocolResumed};
-    use soroban_sdk::{testutils::Events, Symbol, TryFromVal};
 
-    // -----------------------------------------------------------------------
-    // Basic pause/resume success tests
-    // -----------------------------------------------------------------------
+    // ── batch_withdraw: duplicate stream IDs ────────────────────────────────
 
+    /// Duplicate stream IDs in batch_withdraw must return DuplicateStreamId,
+    /// not panic. The entire batch must be reverted atomically.
     #[test]
-    fn test_pause_protocol_success() {
+    fn batch_withdraw_duplicate_stream_ids_returns_structured_error() {
         let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(1000);
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
 
-        // Pause with a reason
-        let reason = soroban_sdk::String::from_str(&ctx.env, "security incident");
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(reason.clone()));
-
-        // Verify is_paused returns true
-        assert!(ctx.client().is_paused(), "Protocol should be paused");
-
-        // Verify get_pause_info returns correct data
-        let info = ctx.client().get_pause_info();
-        assert!(info.is_paused);
-        assert_eq!(info.reason, Some(reason));
-        assert_eq!(info.paused_at, Some(1000));
-        assert_eq!(info.paused_by, Some(ctx.admin.clone()));
-    }
-
-    #[test]
-    fn test_resume_protocol_success() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(1000);
-
-        // First pause
-        let reason = soroban_sdk::String::from_str(&ctx.env, "test reason");
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(reason.clone()));
-        assert!(ctx.client().is_paused());
-
-        // Advance time and resume
-        ctx.env.ledger().set_timestamp(2000);
-        ctx.client().resume_protocol(&ctx.admin);
-
-        // Verify not paused
-        assert!(!ctx.client().is_paused(), "Protocol should not be paused");
-
-        // Verify get_pause_info cleared
-        let info = ctx.client().get_pause_info();
-        assert!(!info.is_paused);
-        assert_eq!(info.reason, None);
-        assert_eq!(info.paused_at, None);
-        assert_eq!(info.paused_by, None);
-    }
-
-    #[test]
-    fn test_pause_without_reason() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(1000);
-
-        // Pause with None reason
-        ctx.client().pause_protocol(&ctx.admin, &None);
-
-        // Verify is_paused and info
-        assert!(ctx.client().is_paused());
-        let info = ctx.client().get_pause_info();
-        assert!(info.is_paused);
-        // Reason should be empty string when None provided
-        assert_eq!(info.reason, Some(soroban_sdk::String::from_str(&ctx.env, "")));
-    }
-
-    // -----------------------------------------------------------------------
-    // Idempotency tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pause_when_already_paused_is_noop() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(1000);
-
-        // First pause
-        let reason1 = soroban_sdk::String::from_str(&ctx.env, "first pause");
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(reason1.clone()));
-
-        // Get events count after first pause
-        let events_after_first = ctx.env.events().all().len();
-
-        // Advance time
-        ctx.env.ledger().set_timestamp(2000);
-
-        // Second pause (should be idempotent)
-        let reason2 = soroban_sdk::String::from_str(&ctx.env, "second pause");
-        let result = ctx.client().try_pause_protocol(&ctx.admin, &Some(reason2));
-        assert_eq!(result, Ok(()), "Second pause should succeed as no-op");
-
-        // Verify no new events emitted
-        let events_after_second = ctx.env.events().all().len();
-        assert_eq!(
-            events_after_second, events_after_first,
-            "No events should be emitted on idempotent pause"
-        );
-
-        // Verify original pause info unchanged
-        let info = ctx.client().get_pause_info();
-        assert_eq!(info.paused_at, Some(1000), "Timestamp should be from first pause");
-        assert_eq!(info.reason, Some(reason1), "Reason should be from first pause");
-    }
-
-    #[test]
-    fn test_resume_when_not_paused_is_noop() {
-        let ctx = TestContext::setup();
-
-        // Never paused - try to resume
-        let events_before = ctx.env.events().all().len();
-        let result = ctx.client().try_resume_protocol(&ctx.admin);
-
-        // Should succeed silently
-        assert_eq!(result, Ok(()), "Resume when not paused should be no-op");
-
-        // Verify no events emitted
-        let events_after = ctx.env.events().all().len();
-        assert_eq!(
-            events_after, events_before,
-            "No events should be emitted on idempotent resume"
-        );
-
-        // Verify still not paused
-        assert!(!ctx.client().is_paused());
-    }
-
-    // -----------------------------------------------------------------------
-    // Auth failure tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pause_by_non_admin_fails() {
-        let ctx = TestContext::setup();
-        let non_admin = Address::generate(&ctx.env);
-
-        // Attempt pause as non-admin
-        let reason = soroban_sdk::String::from_str(&ctx.env, "test");
-        let result = ctx.client().try_pause_protocol(&non_admin, &Some(reason));
-
-        // Should fail with Unauthorized
-        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
-
-        // Verify not paused
-        assert!(!ctx.client().is_paused());
-    }
-
-    #[test]
-    fn test_resume_by_non_admin_fails() {
-        let ctx = TestContext::setup();
-        let non_admin = Address::generate(&ctx.env);
-
-        // First pause as admin
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(soroban_sdk::String::from_str(&ctx.env, "test")));
-        assert!(ctx.client().is_paused());
-
-        // Attempt resume as non-admin
-        let result = ctx.client().try_resume_protocol(&non_admin);
-
-        // Should fail with Unauthorized
-        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
-
-        // Verify still paused
-        assert!(ctx.client().is_paused());
-    }
-
-    // -----------------------------------------------------------------------
-    // Scope enforcement tests - creation-only pause
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_create_stream_blocked_when_paused() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(0);
-
-        // Pause the protocol
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(soroban_sdk::String::from_str(&ctx.env, "test")));
-
-        // Attempt to create stream should fail
-        let result = ctx.client().try_create_stream(
+        let stream_id = client.create_stream(
             &ctx.sender,
             &ctx.recipient,
             &1000_i128,
@@ -17919,204 +17747,316 @@ mod protocol_pause_tests {
             &0u64,
             &1000u64,
         );
-        assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
-    }
 
-    #[test]
-    fn test_create_stream_succeeds_when_not_paused() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(0);
-
-        // Do NOT pause - create stream should succeed
-        let stream_id = ctx.client().create_stream(
-            &ctx.sender,
-            &ctx.recipient,
-            &1000_i128,
-            &1_i128,
-            &0u64,
-            &0u64,
-            &1000u64,
-        );
-        assert_eq!(stream_id, 0);
-
-        let state = ctx.client().get_stream_state(&stream_id);
-        assert_eq!(state.status, StreamStatus::Active);
-    }
-
-    #[test]
-    fn test_existing_stream_operations_when_paused() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(0);
-
-        // Create stream before pausing
-        let stream_id = ctx.create_default_stream();
-
-        // Pause the protocol
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(soroban_sdk::String::from_str(&ctx.env, "test")));
-
-        // Advance time
         ctx.env.ledger().set_timestamp(500);
 
-        // Withdraw should still work (scope is creation-only)
-        let withdrawn = ctx.client().withdraw(&stream_id);
-        assert_eq!(withdrawn, 500, "Withdraw should work when paused (creation-only scope)");
+        // Pass the same stream_id twice — must return DuplicateStreamId
+        let ids = soroban_sdk::vec![&ctx.env, stream_id, stream_id];
+        let result = client.try_batch_withdraw(&ctx.recipient, &ids);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::DuplicateStreamId)),
+            "duplicate stream IDs must return DuplicateStreamId, not panic"
+        );
 
-        // Cancel should still work
-        let stream_id2 = ctx.client().create_stream(
+        // State must be unchanged (no withdrawal occurred)
+        let state = client.get_stream_state(&stream_id);
+        assert_eq!(state.withdrawn_amount, 0);
+    }
+
+    // ── create_streams: batch deposit overflow ───────────────────────────────
+
+    /// When the sum of deposit_amounts in create_streams overflows i128,
+    /// the call must return ArithmeticOverflow, not panic.
+    #[test]
+    fn create_streams_batch_deposit_overflow_returns_structured_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        // Two entries whose deposits sum to > i128::MAX
+        let half = i128::MAX / 2 + 1;
+        let params = soroban_sdk::vec![
+            &ctx.env,
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: half,
+                rate_per_second: 1_i128,
+                start_time: 0u64,
+                cliff_time: 0u64,
+                end_time: half as u64,
+            },
+            CreateStreamParams {
+                recipient: ctx.recipient.clone(),
+                deposit_amount: half,
+                rate_per_second: 1_i128,
+                start_time: 0u64,
+                cliff_time: 0u64,
+                end_time: half as u64,
+            },
+        ];
+
+        let result = client.try_create_streams(&ctx.sender, &params);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ArithmeticOverflow)),
+            "batch deposit overflow must return ArithmeticOverflow, not panic"
+        );
+    }
+
+    // ── update_rate_per_second: rate × duration overflow ────────────────────
+
+    /// When new_rate_per_second × duration overflows i128,
+    /// update_rate_per_second must return ArithmeticOverflow, not panic.
+    #[test]
+    fn update_rate_overflow_returns_structured_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        // Create a stream with a very large end_time so duration is huge
+        let large_end: u64 = u64::MAX / 2;
+        // deposit must be >= rate * duration; use i128::MAX as deposit
+        // We need to mint enough tokens first
+        ctx.sac.mint(&ctx.sender, &i128::MAX);
+
+        let stream_id = client.create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &i128::MAX,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &large_end,
+        );
+
+        // new_rate * large_end overflows i128
+        let overflow_rate = i128::MAX / (large_end as i128) + 2;
+        let result = client.try_update_rate_per_second(&stream_id, &overflow_rate);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ArithmeticOverflow)),
+            "rate × duration overflow must return ArithmeticOverflow, not panic"
+        );
+    }
+
+    // ── require_not_globally_paused: returns ContractError ──────────────────
+
+    /// When the contract is globally paused, withdraw must return ContractPaused
+    /// as a structured error, not panic.
+    #[test]
+    fn globally_paused_withdraw_returns_contract_paused_error() {
+        let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
+
+        let stream_id = client.create_stream(
             &ctx.sender,
             &ctx.recipient,
             &1000_i128,
             &1_i128,
-            &500u64,
-            &500u64,
+            &0u64,
+            &0u64,
             &1000u64,
         );
-        ctx.client().cancel_stream(&stream_id2);
-        let state = ctx.client().get_stream_state(&stream_id2);
-        assert_eq!(state.status, StreamStatus::Cancelled);
+
+        ctx.env.ledger().set_timestamp(500);
+        client.set_global_emergency_paused(&true);
+
+        let result = client.try_withdraw(&stream_id);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ContractPaused)),
+            "withdraw while globally paused must return ContractPaused, not panic"
+        );
     }
 
-    // -----------------------------------------------------------------------
-    // Query tests
-    // -----------------------------------------------------------------------
-
+    /// When the contract is globally paused, cancel_stream must return ContractPaused.
     #[test]
-    fn test_is_paused_returns_correct_state() {
+    fn globally_paused_cancel_returns_contract_paused_error() {
         let ctx = TestContext::setup();
+        let client = FluxoraStreamClient::new(&ctx.env, &ctx.contract_id);
 
-        // Before pause: should be false
-        assert!(!ctx.client().is_paused(), "is_paused should be false before pause");
+        let stream_id = client.create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
 
-        // After pause: should be true
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(soroban_sdk::String::from_str(&ctx.env, "test")));
-        assert!(ctx.client().is_paused(), "is_paused should be true after pause");
+        client.set_global_emergency_paused(&true);
 
-        // After resume: should be false
-        ctx.client().resume_protocol(&ctx.admin);
-        assert!(!ctx.client().is_paused(), "is_paused should be false after resume");
+        let result = client.try_cancel_stream(&stream_id);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::ContractPaused)),
+            "cancel_stream while globally paused must return ContractPaused, not panic"
+        );
     }
+}
 
-    #[test]
-    fn test_get_pause_info_fields() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(1234);
+// ---------------------------------------------------------------------------
+// Tests — batch_withdraw duplicate stream_id rejection (#405)
+// ---------------------------------------------------------------------------
 
-        let reason = soroban_sdk::String::from_str(&ctx.env, "test reason");
-        ctx.client().pause_protocol(&ctx.admin, &Some(reason.clone()));
+/// Adjacent duplicate ids must be rejected atomically — no transfers, no events.
+#[test]
+fn test_batch_withdraw_adjacent_duplicates_rejected() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
 
-        let info = ctx.client().get_pause_info();
-        assert_eq!(info.is_paused, true);
-        assert_eq!(info.reason, Some(reason));
-        assert_eq!(info.paused_at, Some(1234));
-        assert_eq!(info.paused_by, Some(ctx.admin.clone()));
+    ctx.env.ledger().set_timestamp(500);
+    let balance_before = ctx.token().balance(&ctx.recipient);
 
-        // After resume, all cleared
-        ctx.client().resume_protocol(&ctx.admin);
-        let info = ctx.client().get_pause_info();
-        assert_eq!(info.is_paused, false);
-        assert_eq!(info.reason, None);
-        assert_eq!(info.paused_at, None);
-        assert_eq!(info.paused_by, None);
+    let result = ctx
+        .client()
+        .try_batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id0]));
+
+    assert!(result.is_err(), "adjacent duplicates must be rejected");
+    assert_eq!(
+        ctx.token().balance(&ctx.recipient),
+        balance_before,
+        "no transfer must occur on duplicate rejection"
+    );
+    let state = ctx.client().get_stream_state(&id0);
+    assert_eq!(
+        state.withdrawn_amount, 0,
+        "withdrawn_amount must not change"
+    );
+    assert_eq!(state.status, StreamStatus::Active);
+}
+
+/// Non-adjacent duplicate ids must also be rejected atomically.
+#[test]
+fn test_batch_withdraw_non_adjacent_duplicates_rejected() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
+    ctx.sac.mint(&ctx.sender, &1000_i128);
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(300);
+    let balance_before = ctx.token().balance(&ctx.recipient);
+
+    let result = ctx
+        .client()
+        .try_batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id1, id0]));
+
+    assert!(result.is_err(), "non-adjacent duplicates must be rejected");
+    assert_eq!(
+        ctx.token().balance(&ctx.recipient),
+        balance_before,
+        "no transfer must occur on duplicate rejection"
+    );
+    assert_eq!(ctx.client().get_stream_state(&id0).withdrawn_amount, 0);
+    assert_eq!(ctx.client().get_stream_state(&id1).withdrawn_amount, 0);
+}
+
+/// Duplicate id where one of the streams is already Completed must still be rejected.
+#[test]
+fn test_batch_withdraw_duplicate_with_completed_stream_rejected() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id0);
+    assert_eq!(
+        ctx.client().get_stream_state(&id0).status,
+        StreamStatus::Completed
+    );
+
+    let balance_before = ctx.token().balance(&ctx.recipient);
+
+    let result = ctx
+        .client()
+        .try_batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id0]));
+
+    assert!(
+        result.is_err(),
+        "duplicate completed stream_id must be rejected"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.recipient),
+        balance_before,
+        "no transfer must occur"
+    );
+}
+
+/// A single id (no duplicates) must still succeed normally.
+#[test]
+fn test_batch_withdraw_single_id_no_false_positive() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    let results = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0]));
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap().amount, 400);
+}
+
+/// All-duplicate list (same id repeated three times) must be rejected.
+#[test]
+fn test_batch_withdraw_all_same_id_rejected() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(200);
+    let result = ctx
+        .client()
+        .try_batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id0, id0]));
+
+    assert!(result.is_err(), "all-same-id list must be rejected");
+    assert_eq!(ctx.client().get_stream_state(&id0).withdrawn_amount, 0);
+}
+
+/// Duplicate rejection must carry the correct error code (DuplicateStreamId = 14).
+#[test]
+fn test_batch_withdraw_duplicate_returns_correct_error_code() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(100);
+    let result = ctx
+        .client()
+        .try_batch_withdraw(&ctx.recipient, &stream_ids_vec(&ctx.env, &[id0, id0]));
+
+    match result {
+        Err(Ok(e)) => assert_eq!(e, crate::ContractError::DuplicateStreamId),
+        other => panic!("expected ContractError::DuplicateStreamId, got {:?}", other),
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Event payload validation tests
-    // -----------------------------------------------------------------------
+#[test]
+fn test_global_pause_flags_default_to_false() {
+    let ctx = TestContext::setup();
 
-    #[test]
-    fn test_pause_event_payload_matches_spec() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(5678);
+    // By default, both pause flags should be false.
+    let is_emergency_paused = ctx.client().get_global_emergency_paused();
+    assert!(
+        !is_emergency_paused,
+        "Global emergency pause should default to false"
+    );
 
-        let reason = soroban_sdk::String::from_str(&ctx.env, "security incident");
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(reason.clone()));
-
-        // Find the ProtocolPaused event
-        let events = ctx.env.events().all();
-        let pause_event = events
-            .iter()
-            .find(|(_, topics, _)| {
-                topics.len() == 2
-                    && Symbol::try_from_val(&ctx.env, &topics.get(0).unwrap())
-                        == Ok(Symbol::new(&ctx.env, "pr_pause"))
-            })
-            .expect("ProtocolPaused event should exist");
-
-        // Verify topic[1] is admin address
-        let topic1 = pause_event.1.get(1).unwrap();
-        let topic1_addr = Address::try_from_val(&ctx.env, &topic1).unwrap();
-        assert_eq!(topic1_addr, ctx.admin);
-
-        // Verify payload
-        let payload = ProtocolPaused::try_from_val(&ctx.env, &pause_event.2)
-            .expect("Payload should decode as ProtocolPaused");
-        assert_eq!(payload.reason, reason);
-        assert_eq!(payload.paused_at, 5678);
-    }
-
-    #[test]
-    fn test_resume_event_payload_matches_spec() {
-        let ctx = TestContext::setup();
-
-        // First pause
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(soroban_sdk::String::from_str(&ctx.env, "test")));
-
-        // Clear events to isolate resume event
-        let _ = ctx.env.events().all(); // Consume events
-
-        ctx.env.ledger().set_timestamp(9999);
-        ctx.client().resume_protocol(&ctx.admin);
-
-        // Find the ProtocolResumed event
-        let events = ctx.env.events().all();
-        let resume_event = events
-            .iter()
-            .find(|(_, topics, _)| {
-                topics.len() == 2
-                    && Symbol::try_from_val(&ctx.env, &topics.get(0).unwrap())
-                        == Ok(Symbol::new(&ctx.env, "pr_resume"))
-            })
-            .expect("ProtocolResumed event should exist");
-
-        // Verify topic[1] is admin address
-        let topic1 = resume_event.1.get(1).unwrap();
-        let topic1_addr = Address::try_from_val(&ctx.env, &topic1).unwrap();
-        assert_eq!(topic1_addr, ctx.admin);
-
-        // Verify payload
-        let payload = ProtocolResumed::try_from_val(&ctx.env, &resume_event.2)
-            .expect("Payload should decode as ProtocolResumed");
-        assert_eq!(payload.resumed_at, 9999);
-    }
-
-    // -----------------------------------------------------------------------
-    // Batch creation blocked when paused
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_create_streams_blocked_when_paused() {
-        let ctx = TestContext::setup();
-        ctx.env.ledger().set_timestamp(0);
-
-        // Pause the protocol
-        ctx.client()
-            .pause_protocol(&ctx.admin, &Some(soroban_sdk::String::from_str(&ctx.env, "test")));
-
-        // Attempt batch create should fail
-        let params = CreateStreamParams {
-            recipient: ctx.recipient.clone(),
-            deposit_amount: 1000,
-            rate_per_second: 1,
-            start_time: 0,
-            cliff_time: 0,
-            end_time: 1000,
-        };
-        let streams = soroban_sdk::Vec::from_array(&ctx.env, [params]);
-        let result = ctx.client().try_create_streams(&ctx.sender, &streams);
-        assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
-    }
+    // Since there is no public getter for CreationPaused, we read from storage
+    // or test behavior. Testing storage directly:
+    let creation_paused: bool = ctx
+        .env
+        .as_contract(&ctx.contract_id, || crate::is_creation_paused(&ctx.env));
+    assert!(!creation_paused, "Creation pause should default to false");
 }

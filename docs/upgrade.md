@@ -15,7 +15,7 @@ Version policy, migration runbook, and audit notes for operators, integrators, a
 ### Current value
 
 ```
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 ```
 
 ### When to increment
