@@ -479,6 +479,7 @@ contract.create_streams_relative(&sender, &params)?;
 | `close_completed_stream`  | Anyone                        | None (permissionless terminal cleanup)     |
 | `top_up_stream`           | Funder address                | `funder.require_auth()`                     |
 | `update_rate_per_second`  | Sender                        | `sender.require_auth()`                     |
+| `decrease_rate_per_second`| Sender                        | `sender.require_auth()`                     |
 | `shorten_stream_end_time` | Sender                        | `sender.require_auth()`                     |
 | `extend_stream_end_time`  | Sender                        | `sender.require_auth()`                     |
 
@@ -564,6 +565,21 @@ loop {
 - Event semantics: a successful top-up emits exactly one contract event with topics `("top_up", stream_id)` and payload `StreamToppedUp { stream_id, top_up_amount: amount, new_deposit_amount }`.
 
 Treasury policy note: if an application wants to restrict who may fund streams, that policy must be enforced off-chain or in a wrapper contract. The base stream contract intentionally accepts any self-authorizing funder.
+
+### decrease_rate_per_second: Observable Semantics
+
+`decrease_rate_per_second(stream_id, new_rate_per_second)` allows the stream sender to safely reduce the streaming rate.
+A naive decrease would retroactively lower the recipient's accrued tokens. To prevent this, the contract **checkpoints** the stream: it locks in the mathematical accrual up to the current timestamp under the old rate, and applies the new rate only moving forward.
+
+- **Check-Effects-Interactions (CEI)**: Computes accrual, reduces deposit amount, persists stream state, and finally refunds the difference to the sender.
+- **Rate Validation**: `0 < new_rate_per_second < current rate_per_second`.
+- **Refund**: The sender receives a refund of `old_deposit - new_deposit`, where `new_deposit = checkpointed_amount + new_rate * remaining_seconds`.
+
+#### Failures
+- **Unauthorized**: Caller is not the original sender.
+- **InvalidState**: Stream is already expired (`now >= end_time`).
+- **StreamTerminalState**: Stream is Cancelled or Completed.
+- **InvalidParams**: `new_rate_per_second <= 0` or `new_rate_per_second >= old_rate`.
 
 ### update_rate_per_second: Observable Semantics
 

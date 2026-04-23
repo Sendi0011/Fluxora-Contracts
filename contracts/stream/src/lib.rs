@@ -82,7 +82,9 @@ pub const MAX_PAGE_SIZE: u64 = 100;
 /// - If an operator forgets to increment this constant before deploying a breaking change,
 ///   integrators will not detect the incompatibility until a runtime failure occurs.
 ///   Code review and CI checks on this constant are the primary safeguard.
-pub const CONTRACT_VERSION: u32 = 1;
+/// Bumped to 2: `Stream` struct gained `checkpointed_amount: i128` and `checkpointed_at: u64`
+/// for safe rate-decrease support (see `decrease_rate_per_second`).
+pub const CONTRACT_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -194,6 +196,25 @@ pub struct RateUpdated {
     pub effective_time: u64,
 }
 
+/// Emitted when the sender safely decreases the streaming rate via `decrease_rate_per_second`.
+///
+/// The `checkpointed_amount` field records how many tokens were mathematically
+/// accrued under the **old** rate at the moment of the rate change. The new rate
+/// is applied only to the remaining stream duration from `effective_time` onward.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateDecreased {
+    pub stream_id: u64,
+    pub old_rate_per_second: i128,
+    pub new_rate_per_second: i128,
+    /// Ledger timestamp when the decrease became effective (== `checkpointed_at`).
+    pub effective_time: u64,
+    /// Accrued amount locked in at `effective_time` under the old rate.
+    pub checkpointed_amount: i128,
+    /// Tokens refunded to the sender: `old_deposit - new_max_payable`.
+    pub refund_amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamEndShortened {
@@ -263,6 +284,14 @@ pub struct Stream {
     pub withdrawn_amount: i128,
     pub status: StreamStatus,
     pub cancelled_at: Option<u64>,
+    /// Total tokens mathematically accrued up to `checkpointed_at` under all
+    /// previous rates. Updated by `decrease_rate_per_second` (and by
+    /// `update_rate_per_second` for symmetry) so that the new rate applies only
+    /// from `checkpointed_at` forward. Initialised to 0 at stream creation.
+    pub checkpointed_amount: i128,
+    /// Ledger timestamp of the last rate change (or `start_time` on creation).
+    /// `calculate_accrued` uses this as the start of the current rate epoch.
+    pub checkpointed_at: u64,
 }
 
 #[contracttype]
@@ -678,6 +707,10 @@ impl FluxoraStream {
             withdrawn_amount: 0,
             status: StreamStatus::Active,
             cancelled_at: None,
+            // Checkpoint initialised to zero accrual at start_time so the
+            // first rate epoch covers [start_time, end_time] at rate_per_second.
+            checkpointed_amount: 0,
+            checkpointed_at: start_time,
         };
 
         save_stream(env, &stream);
@@ -1874,8 +1907,10 @@ impl FluxoraStream {
             env.ledger().timestamp()
         };
 
-        Ok(accrual::calculate_accrued_amount(
+        Ok(accrual::calculate_accrued_amount_checkpointed(
             stream.start_time,
+            stream.checkpointed_amount,
+            stream.checkpointed_at,
             stream.cliff_time,
             stream.end_time,
             stream.rate_per_second,
@@ -1969,8 +2004,10 @@ impl FluxoraStream {
             StreamStatus::Completed => unreachable!("returned above"),
         };
 
-        let accrued = accrual::calculate_accrued_amount(
+        let accrued = accrual::calculate_accrued_amount_checkpointed(
             stream.start_time,
+            stream.checkpointed_amount,
+            stream.checkpointed_at,
             stream.cliff_time,
             stream.end_time,
             stream.rate_per_second,
@@ -2154,7 +2191,7 @@ impl FluxoraStream {
         }
 
         let old_rate = stream.rate_per_second;
-        // Forward-only semantics: disallow decreases.
+        // Forward-only semantics: disallow decreases (use decrease_rate_per_second for that).
         if new_rate_per_second <= old_rate {
             return Err(ContractError::InvalidParams);
         }
@@ -2169,6 +2206,20 @@ impl FluxoraStream {
             return Err(ContractError::InsufficientDeposit);
         }
 
+        // Checkpoint accrued-to-date so the rate increase applies forward-only.
+        let now = env.ledger().timestamp();
+        let accrued_now = accrual::calculate_accrued_amount_checkpointed(
+            stream.start_time,
+            stream.checkpointed_amount,
+            stream.checkpointed_at,
+            stream.cliff_time,
+            stream.end_time,
+            old_rate,
+            stream.deposit_amount,
+            now,
+        );
+        stream.checkpointed_amount = accrued_now;
+        stream.checkpointed_at = now;
         stream.rate_per_second = new_rate_per_second;
         save_stream(&env, &stream);
 
@@ -2178,7 +2229,149 @@ impl FluxoraStream {
                 stream_id,
                 old_rate_per_second: old_rate,
                 new_rate_per_second,
-                effective_time: env.ledger().timestamp(),
+                effective_time: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Safely decrease the streaming rate while preserving the recipient's accrued entitlement.
+    ///
+    /// This is the **safe decrease** counterpart to [`update_rate_per_second`] (which only
+    /// permits increases). A naive rate decrease would retroactively reduce previously-accrued
+    /// tokens, harming the recipient. This function prevents that by first taking a
+    /// **checkpoint**: it locks in the mathematical accrual at the current moment under the
+    /// old rate, then applies the new (lower) rate only for the remaining duration.
+    ///
+    /// ## Safety invariants proven
+    ///
+    /// 1. **Withdrawable never decreases**: immediately after the call, `calculate_accrued()`
+    ///    returns exactly the same value as it did one instant before the call (the
+    ///    `checkpointed_amount` is set to the pre-call accrual value and `checkpointed_at`
+    ///    is set to `now`). Future accrual continues from this baseline.
+    ///
+    /// 2. **Total payable never exceeds deposit**: `new_deposit = checkpointed_amount +
+    ///    new_rate × remaining_seconds`. The deposit is reduced to this amount and the
+    ///    difference is refunded to the sender immediately.
+    ///
+    /// ## Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_rate_per_second`: New streaming rate in tokens per second.
+    ///   Must satisfy `0 < new_rate < current rate_per_second`.
+    ///
+    /// ## Authorization
+    /// - Requires authorization from the stream's original sender only.
+    ///   Admin cannot call this; if an emergency rate cut is needed, use `cancel_stream_as_admin`.
+    ///
+    /// ## State Changes
+    /// - `stream.checkpointed_amount` ← accrual at `now` under the old rate.
+    /// - `stream.checkpointed_at` ← `now`.
+    /// - `stream.rate_per_second` ← `new_rate_per_second`.
+    /// - `stream.deposit_amount` ← `checkpointed_amount + new_rate × max(0, end_time − now)`.
+    /// - Refunds `old_deposit − new_deposit` tokens to the sender.
+    ///
+    /// ## Returns
+    /// - `Ok(())` on success.
+    ///
+    /// ## Errors
+    /// - `StreamNotFound`      — `stream_id` does not exist.
+    /// - `Unauthorized`        — caller is not the stream sender.
+    /// - `StreamTerminalState` — stream is `Completed` or `Cancelled`.
+    /// - `InvalidState`        — stream is past its `end_time` (already expired).
+    /// - `InvalidParams`       — `new_rate_per_second <= 0` or `new_rate >= current_rate`.
+    ///
+    /// ## Events
+    /// - Emits `("rate_dec", stream_id) → RateDecreased { ... }` on success.
+    pub fn decrease_rate_per_second(
+        env: Env,
+        stream_id: u64,
+        new_rate_per_second: i128,
+    ) -> Result<(), ContractError> {
+        require_not_globally_paused(&env);
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Sender-only: only the original creator may reduce the rate.
+        Self::require_stream_sender(&stream.sender);
+
+        // Terminal streams cannot be mutated.
+        if stream.status == StreamStatus::Completed || stream.status == StreamStatus::Cancelled {
+            return Err(ContractError::StreamTerminalState);
+        }
+
+        // Reject once the stream has expired; remaining duration would be zero.
+        let now = env.ledger().timestamp();
+        if now >= stream.end_time {
+            return Err(ContractError::InvalidState);
+        }
+
+        // Validate the new rate: must be strictly positive and strictly less than the current rate.
+        if new_rate_per_second <= 0 {
+            return Err(ContractError::InvalidParams);
+        }
+        let old_rate = stream.rate_per_second;
+        if new_rate_per_second >= old_rate {
+            // Must use update_rate_per_second for increases.
+            return Err(ContractError::InvalidParams);
+        }
+
+        // ── Checkpoint ────────────────────────────────────────────────────────────
+        // Lock in accrual under the OLD rate at this exact instant.  Any value the
+        // recipient could have withdrawn before this call remains reachable after.
+        let accrued_now = accrual::calculate_accrued_amount_checkpointed(
+            stream.start_time,
+            stream.checkpointed_amount,
+            stream.checkpointed_at,
+            stream.cliff_time,
+            stream.end_time,
+            old_rate,
+            stream.deposit_amount,
+            now,
+        );
+
+        // ── New deposit ceiling ────────────────────────────────────────────────────
+        // Maximum tokens payable under the new rate:
+        //   checkpoint + new_rate × remaining_seconds
+        let remaining_seconds = (stream.end_time - now) as i128;
+        let future_accrual = new_rate_per_second
+            .checked_mul(remaining_seconds)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        let new_deposit = accrued_now
+            .checked_add(future_accrual)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+
+        // new_deposit must fit within the old deposit (guaranteed by lower rate * same duration).
+        let old_deposit = stream.deposit_amount;
+        let refund_amount = old_deposit
+            .checked_sub(new_deposit)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+
+        // Sanity: refund must be non-negative (lower rate → smaller max payable).
+        if refund_amount < 0 {
+            return Err(ContractError::InvalidState);
+        }
+
+        // ── CEI: persist state before token transfer ───────────────────────────────
+        stream.checkpointed_amount = accrued_now;
+        stream.checkpointed_at = now;
+        stream.rate_per_second = new_rate_per_second;
+        stream.deposit_amount = new_deposit;
+        save_stream(&env, &stream);
+
+        // Refund the now-unreachable portion of the deposit to the sender.
+        if refund_amount > 0 {
+            push_token(&env, &stream.sender, refund_amount)?;
+        }
+
+        env.events().publish(
+            (symbol_short!("rate_dec"), stream_id),
+            RateDecreased {
+                stream_id,
+                old_rate_per_second: old_rate,
+                new_rate_per_second,
+                effective_time: now,
+                checkpointed_amount: accrued_now,
+                refund_amount,
             },
         );
 
@@ -2776,8 +2969,11 @@ impl FluxoraStream {
         Self::require_cancellable_status(stream.status)?;
 
         let now = env.ledger().timestamp();
-        let accrued_at_cancel = accrual::calculate_accrued_amount(
+        // Use checkpoint-aware accrual so rate-decreased streams are cancelled correctly.
+        let accrued_at_cancel = accrual::calculate_accrued_amount_checkpointed(
             stream.start_time,
+            stream.checkpointed_amount,
+            stream.checkpointed_at,
             stream.cliff_time,
             stream.end_time,
             stream.rate_per_second,

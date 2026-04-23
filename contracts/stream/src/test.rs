@@ -10119,11 +10119,11 @@ fn test_update_rate_per_second_before_cliff() {
     let accrued_after = ctx.client().calculate_accrued(&stream_id);
     assert_eq!(accrued_after, 0);
 
-    // After cliff at t=600, accrual uses new rate.
+    // After cliff at t=600, accrual uses new rate forward-only from checkpoint (t=100).
     ctx.env.ledger().set_timestamp(600);
     let accrued_post_cliff = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 600 - 0 = 600, rate = 2 → 1200 accrued (capped at deposit 2000).
-    assert_eq!(accrued_post_cliff, 1200);
+    // checkpoint_at=100, checkpointed_amount=0, rate=2, elapsed=600-100=500 → 0+1000=1000
+    assert_eq!(accrued_post_cliff, 1000);
 }
 
 #[test]
@@ -10196,8 +10196,8 @@ fn test_update_rate_per_second_near_end_time() {
     // After end_time at t=1100, accrual is capped at end_time.
     ctx.env.ledger().set_timestamp(1100);
     let accrued_final = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 1000 (capped at end_time), rate = 5 → 5000 (capped at deposit 10000).
-    assert_eq!(accrued_final, 5000);
+    // checkpoint at t=950: amount=950; new epoch: 5*(end=1000-950)=250; total=1200
+    assert_eq!(accrued_final, 1200);
 }
 
 #[test]
@@ -10221,13 +10221,13 @@ fn test_update_rate_per_second_after_end_time() {
     let accrued_before = ctx.client().calculate_accrued(&stream_id);
     assert_eq!(accrued_before, 1000); // capped at rate * duration
 
-    // Update rate from 1 → 5.
+    // Update rate from 1 → 5 (at t=1500, past end_time=1000).
     ctx.client().update_rate_per_second(&stream_id, &5_i128);
 
-    // Accrual is still capped at end_time.
+    // Accrual is still capped at end_time; checkpoint_at=1500 >= end=1000,
+    // so no additional accrual is possible beyond the checkpointed 1000 tokens.
     let accrued_after = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 1000 (capped), rate = 5 → 5000 (capped at deposit 10000).
-    assert_eq!(accrued_after, 5000);
+    assert_eq!(accrued_after, 1000);
 }
 
 #[test]
@@ -10261,11 +10261,11 @@ fn test_update_rate_per_second_with_partial_withdrawal() {
     // At t=400, calculate new withdrawable.
     ctx.env.ledger().set_timestamp(400);
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 400, rate = 5 → 2000 accrued.
-    assert_eq!(accrued, 2000);
+    // checkpoint at t=300: amount=300; new epoch rate=5: 5*(400-300)=500; total=800
+    assert_eq!(accrued, 800);
 
     let withdrawable = accrued - state.withdrawn_amount;
-    assert_eq!(withdrawable, 1700);
+    assert_eq!(withdrawable, 500);
 }
 
 #[test]
@@ -10346,12 +10346,12 @@ fn test_update_rate_per_second_on_paused_stream_after_partial_withdrawal() {
     assert_eq!(state_after.status, StreamStatus::Paused);
     assert_eq!(state_after.withdrawn_amount, 300);
 
-    // Accrued should use new rate retroactively.
+    // Accrued at the same timestamp (t=300): checkpoint locked in accrual=300; rate applies forward.
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    assert_eq!(accrued, 300 * 5); // 1500
+    assert_eq!(accrued, 300); // checkpoint preserves prior accrual; no new seconds elapsed yet
 
     let withdrawable = accrued - state_after.withdrawn_amount;
-    assert_eq!(withdrawable, 1200);
+    assert_eq!(withdrawable, 0); // already fully withdrawn up to this point
 }
 
 #[test]
@@ -10387,13 +10387,12 @@ fn test_update_rate_per_second_after_partial_withdrawal_then_resume_and_withdraw
     // At t=400, withdraw again.
     ctx.env.ledger().set_timestamp(400);
     let withdrawn2 = ctx.client().withdraw(&stream_id);
-    // Accrued at t=400 with rate=3: 400*3 = 1200
-    // Withdrawn so far: 200
-    // Withdrawable: 1000
-    assert_eq!(withdrawn2, 1000);
+    // Checkpoint at t=200: amount=200; new epoch rate=3: 3*(400-200)=600; total=800
+    // Withdrawn so far: 200; withdrawable: 800-200=600
+    assert_eq!(withdrawn2, 600);
 
     let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.withdrawn_amount, 1200);
+    assert_eq!(state.withdrawn_amount, 800);
     assert_eq!(state.status, StreamStatus::Active);
 }
 
@@ -10565,11 +10564,11 @@ fn test_update_rate_per_second_interaction_with_pause_resume() {
     ctx.env.ledger().set_timestamp(200);
     ctx.client().resume_stream(&stream_id);
 
-    // Verify accrual uses new rate.
+    // Verify accrual uses new rate from checkpoint at t=100.
     ctx.env.ledger().set_timestamp(300);
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    // elapsed = 300, rate = 5 → 1500 accrued.
-    assert_eq!(accrued, 1500);
+    // checkpoint at t=100: amount=100; new epoch: 5*(300-100)=1000; total=1100
+    assert_eq!(accrued, 1100);
 }
 
 #[test]
@@ -14573,7 +14572,7 @@ fn regression_missing_config_version_still_works() {
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
     let version = client.version();
-    assert_eq!(version, 1, "version must be accessible without init");
+    assert_eq!(version, 2, "version must be accessible without init");
 }
 
 /// `get_stream_state()` for a non-existent stream on an uninitialised
