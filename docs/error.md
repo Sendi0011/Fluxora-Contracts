@@ -152,7 +152,7 @@ match client.try_create_stream(&sender, &recipient, &deposit, &rate, &start, &cl
 
 ### ContractPaused (4)
 
-**Definition**: Global emergency pause is active; non-admin mutations are blocked.
+**Definition**: The protocol is globally paused. No new streams may be created.
 
 **Trigger Conditions**:
 - Admin called `set_global_emergency_paused(true)` or `set_contract_paused(true)`
@@ -161,18 +161,23 @@ match client.try_create_stream(&sender, &recipient, &deposit, &rate, &start, &cl
 **Affected Roles**:
 | Role | Can Trigger | Notes |
 |------|------------|-------|
-| Sender | Yes | Create/modify streams blocked |
-| Recipient | Yes | `withdraw` blocked (use `calculate_accrued` to check balance) |
-| Admin | No | Admin operations exempt |
+| Sender | Yes | Create streams blocked when paused |
+| Recipient | No | Existing streams unaffected; can still withdraw |
+| Admin | No | Admin operations exempt; admin can always pause/resume |
 
 **Client Action**:
 ```rust
 match client.try_create_stream(...) {
     Ok(stream_id) => { /* success */ }
     Err(ContractError::ContractPaused) => {
-        // Notify user: "Contract temporarily paused"
-        // Check `get_config` for pause status
+        // Notify user: "Protocol temporarily paused"
+        // Check `is_paused()` for current status
+        // Check `get_pause_info()` for reason and timestamp
         // Retry later or contact admin
+        let info = client.get_pause_info();
+        if let Some(ref reason) = info.reason {
+            println!("Pause reason: {}", reason);
+        }
     }
     Err(e) => { /* handle other errors */ }
 }
@@ -181,7 +186,9 @@ match client.try_create_stream(...) {
 **Success Semantics**: Returns `u64` stream_id (when unpaused).
 
 **Integrator Note**: During pause, `calculate_accrued` and `get_stream_state` remain functional.
-Recipients can check their balance but cannot withdraw.
+Recipients can check their balance and withdraw from existing streams. Only NEW stream
+creation is blocked. Use `is_paused()` for a quick check or `get_pause_info()` for full
+audit trail (reason, timestamp, admin who paused).
 
 ---
 

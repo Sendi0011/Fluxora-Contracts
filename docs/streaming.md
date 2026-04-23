@@ -96,7 +96,16 @@ Scope boundary and exclusions:
 
 ### Global Pause Semantics (Issue Scope)
 
-This section is the protocol-level contract for the global pause state managed via `set_contract_paused`.
+This section is the protocol-level contract for the global pause state managed via `pause_protocol` and `resume_protocol`.
+
+**Entrypoints:**
+
+| Function | Description |
+|----------|-------------|
+| `pause_protocol(admin, reason)` | Globally pause new stream creation with audit trail (reason, timestamp, admin) |
+| `resume_protocol(admin)` | Globally resume new stream creation, clearing audit trail |
+| `is_paused()` | Query if protocol is currently paused (permissionless) |
+| `get_pause_info()` | Query detailed pause info including audit trail (permissionless) |
 
 Success semantics (observable):
 
@@ -108,20 +117,24 @@ Success semantics (observable):
 
 Failure semantics (observable):
 
-1. Unauthorized caller on admin path: authorization failure from `admin.require_auth()`.
+1. Unauthorized caller on admin path: `ContractError::Unauthorized`.
 2. Any failure is atomic: no storage mutation, no event emitted.
 
 Role boundaries:
 
-1. `set_contract_paused`: only the contract `admin` can authorize.
+1. `pause_protocol` / `resume_protocol`: only the contract `admin` can authorize.
 2. Senders and recipients cannot pause the global contract. Senders manage individual streams via `pause_stream`.
 
 Invariants when globally paused:
 
 1. No new streams can be persisted (no `created` events, no deposit tokens pulled).
 2. Existing streams do not change status due to a global pause.
+3. Audit trail (reason, timestamp, admin) is queryable via `get_pause_info()`.
 
 Scope boundary: The global pause is strictly an administrative circuit breaker for new liabilities. It does not freeze funds of existing users or prevent recipients from withdrawing their vested entitlement.
+
+**Note on Stream Creation:**
+Stream creation is blocked while the protocol is globally paused. The `create_stream` function returns `ContractError::ContractPaused` if `is_paused()` is true. This applies to both single-stream and batch (`create_streams`) creation.
 
 ```mermaid
 stateDiagram-v2

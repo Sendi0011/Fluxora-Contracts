@@ -277,6 +277,32 @@ pub struct ContractPauseChanged {
     pub paused: bool,
 }
 
+/// Emitted when the protocol is globally paused via `pause_protocol`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolPaused {
+    pub reason: soroban_sdk::String,
+    pub paused_at: u64,
+}
+
+/// Emitted when the protocol is globally resumed via `resume_protocol`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolResumed {
+    pub resumed_at: u64,
+}
+
+/// Information about the current protocol pause state.
+/// Returned by `get_pause_info()` query entrypoint.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PauseInfo {
+    pub is_paused: bool,
+    pub reason: Option<soroban_sdk::String>,
+    pub paused_at: Option<u64>,
+    pub paused_by: Option<Address>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
@@ -385,6 +411,12 @@ pub enum DataKey {
     GlobalEmergencyPaused,
     /// Creation pause flag (bool). Appended to avoid shifting existing key discriminants.
     CreationPaused,
+    /// Protocol pause reason (String). Human-readable reason for the pause.
+    GlobalPauseReason,
+    /// Protocol pause timestamp (u64). Ledger timestamp when pause was activated.
+    GlobalPauseTimestamp,
+    /// Protocol pause admin (Address). The admin address that activated the pause.
+    GlobalPauseAdmin,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +469,42 @@ fn require_not_globally_paused(env: &Env) -> Result<(), ContractError> {
         return Err(ContractError::ContractPaused);
     }
     Ok(())
+}
+
+/// Returns whether the protocol is globally paused (checks both GlobalEmergencyPaused and CreationPaused).
+/// Default is false (not paused) if no pause keys are set.
+fn is_protocol_paused(env: &Env) -> bool {
+    is_global_emergency_paused(env) || is_creation_paused(env)
+}
+
+/// Returns `ContractError::ContractPaused` when the protocol is globally paused.
+/// Use this in state-mutating entrypoints to enforce pause scope.
+fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+    if is_protocol_paused(env) {
+        return Err(ContractError::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Get the stored pause reason, if any.
+fn get_pause_reason(env: &Env) -> Option<soroban_sdk::String> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalPauseReason)
+}
+
+/// Get the stored pause timestamp, if any.
+fn get_pause_timestamp(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalPauseTimestamp)
+}
+
+/// Get the stored pause admin address, if any.
+fn get_pause_admin(env: &Env) -> Option<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalPauseAdmin)
 }
 
 fn read_stream_count(env: &Env) -> u64 {
@@ -3425,6 +3493,166 @@ impl FluxoraStream {
         );
 
         Ok(())
+    }
+
+    /// Globally pause the protocol to block new stream creation.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Idempotency
+    /// - If the protocol is already paused, this is a no-op and returns Ok(()) silently.
+    /// - No storage changes or events are emitted on idempotent calls.
+    ///
+    /// # State Changes (when not already paused)
+    /// - Sets `DataKey::GlobalEmergencyPaused` to true
+    /// - Stores `reason` (or empty string if None) in `DataKey::GlobalPauseReason`
+    /// - Stores current ledger timestamp in `DataKey::GlobalPauseTimestamp`
+    /// - Stores admin address in `DataKey::GlobalPauseAdmin`
+    ///
+    /// # Events
+    /// - Emits `ProtocolPaused` event with reason and timestamp (only on actual pause)
+    pub fn pause_protocol(
+        env: Env,
+        admin: Address,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        // Verify caller is the stored admin
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Idempotent: if already paused, return silently
+        if is_protocol_paused(&env) {
+            // Idempotent: re-pausing is a no-op
+            return Ok(());
+        }
+
+        // Set the global emergency pause flag
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalEmergencyPaused, &true);
+
+        // Store audit trail information
+        let reason_str = reason.unwrap_or_else(|| soroban_sdk::String::from_str(&env, ""));
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalPauseReason, &reason_str);
+
+        let now = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalPauseTimestamp, &now);
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalPauseAdmin, &admin);
+
+        bump_instance_ttl(&env);
+
+        // Emit ProtocolPaused event AFTER storage is written
+        env.events().publish(
+            (symbol_short!("pr_pause"), admin.clone()),
+            ProtocolPaused {
+                reason: reason_str,
+                paused_at: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Globally resume the protocol to allow new stream creation.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Idempotency
+    /// - If the protocol is not currently paused, this is a no-op and returns Ok(()) silently.
+    /// - No storage changes or events are emitted on idempotent calls.
+    ///
+    /// # State Changes (when currently paused)
+    /// - Clears `DataKey::GlobalEmergencyPaused` (sets to false)
+    /// - Clears `DataKey::GlobalPauseReason`
+    /// - Clears `DataKey::GlobalPauseTimestamp`
+    /// - Clears `DataKey::GlobalPauseAdmin`
+    ///
+    /// # Events
+    /// - Emits `ProtocolResumed` event with timestamp (only on actual resume)
+    pub fn resume_protocol(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        // Verify caller is the stored admin
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Idempotent: if not paused, return silently
+        if !is_protocol_paused(&env) {
+            // Idempotent: resuming when not paused is a no-op
+            return Ok(());
+        }
+
+        // Clear all pause-related storage
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalEmergencyPaused, &false);
+        env.storage().instance().remove(&DataKey::GlobalPauseReason);
+        env.storage().instance().remove(&DataKey::GlobalPauseTimestamp);
+        env.storage().instance().remove(&DataKey::GlobalPauseAdmin);
+
+        bump_instance_ttl(&env);
+
+        // Emit ProtocolResumed event
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (symbol_short!("pr_resume"), admin),
+            ProtocolResumed { resumed_at: now },
+        );
+
+        Ok(())
+    }
+
+    /// Query whether the protocol is currently paused.
+    ///
+    /// # Authorization
+    /// - None required. Anyone can call this.
+    ///
+    /// # Returns
+    /// - `true` if the protocol is paused (creation blocked)
+    /// - `false` if the protocol is active (creation allowed)
+    pub fn is_paused(env: Env) -> bool {
+        is_protocol_paused(&env)
+    }
+
+    /// Query detailed pause information including reason, timestamp, and admin.
+    ///
+    /// # Authorization
+    /// - None required. Anyone can call this.
+    ///
+    /// # Returns
+    /// - `PauseInfo` struct with `is_paused`, `reason`, `paused_at`, `paused_by` fields.
+    /// - All optional fields are `None` when not paused.
+    pub fn get_pause_info(env: Env) -> PauseInfo {
+        let is_paused = is_protocol_paused(&env);
+        if is_paused {
+            PauseInfo {
+                is_paused: true,
+                reason: get_pause_reason(&env),
+                paused_at: get_pause_timestamp(&env),
+                paused_by: get_pause_admin(&env),
+            }
+        } else {
+            PauseInfo {
+                is_paused: false,
+                reason: None,
+                paused_at: None,
+                paused_by: None,
+            }
+        }
     }
 }
 

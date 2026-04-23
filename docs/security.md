@@ -167,7 +167,7 @@ All arithmetic that could overflow `i128` uses Rust's `checked_*` methods:
 
 ---
 
-## Global pause
+## Global Emergency Pause
 
 `set_contract_paused(true)` causes `create_stream` and `create_streams` to fail with
 `ContractError::ContractPaused`. Existing streams are unaffected — withdrawals,
